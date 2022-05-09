@@ -20,14 +20,14 @@ RC OnMessage(PTCbMessage pMessage)
     switch(pMessage->eType)
     {
     case MsgType::MSG_PUB_PUT:
-        LogInfo("Put Message(#%lld) to shared memory by channel(%d) process(%d)", pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId);
+        LogInfo("Put Message(#%lld) Message_%d_%d to shared memory by channel(%d) process(%d)", pMessage->nOriginalMsgId, pMessage->nProcessId, pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId);
         break;
     case MsgType::MSG_PUB_ACK:
         if (IS_FAILED(pMessage->eResult)) 
         {
             LogError("Message(#%lld was NOT acknowldeged by channel(%d) process(%d)", pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId);
         }
-        break;
+         break;
     case MsgType::MSG_SUB_GET:
         if (pMessage->nChannelId == g_MixChannelId)
         {
@@ -264,7 +264,15 @@ typedef struct _TestConf
 //
 TestConf g_TestConfiguration[] =
 {
-    {"some_topic", 1000, 10, 10, 50, T_TRUE}  //Default test configuration
+    //Default test configuration
+    {
+        "some_topic",  // Topic string
+        1000,          // Message count per process
+        10,            // Listen process count
+        10,            // Send process count
+        30,            // Listen and send process count
+        T_FALSE        // Indicating whether this is a global channel 
+    }  
 
 };
 
@@ -272,7 +280,7 @@ TestConf g_TestConfiguration[] =
 int main(int argc, char** argv)
 {    
 
-    Logger::Instance().SetLevel(LoggerType::LOG_INFO);
+    Logger::Instance().SetLevel(LoggerType::LOG_WARNING);
     T_UINT32 nMaxConf = sizeof(g_TestConfiguration) / sizeof(TestConf);
 
     if (argc <= 1) 

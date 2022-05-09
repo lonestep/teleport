@@ -186,12 +186,14 @@ RC BaseEvent::Post(T_BOOL bReset)
 {
     if (!SetEvent(m_hHandle))
     {
+        LogWarn("BaseEvent::Post() failed to SetEvent");
         return RC::FAILED;
     }
     if(bReset)
     {
         if(!ResetEvent(m_hHandle))
         {
+            LogWarn("BaseEvent::Post() failed to ResetEvent");
             return RC::FAILED;
         }
     }
@@ -204,6 +206,7 @@ RC BaseEvent::Reset()
 {
     if (!ResetEvent(m_hHandle))
     {
+        LogWarn("BaseEvent::Reset() failed to ResetEvent");
         return RC::FAILED;
     }
     return RC::SUCCESS;
