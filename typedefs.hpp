@@ -95,7 +95,8 @@ namespace TLP
 #define MAX_BUFFER_LEN      256
 #define DEFAULT_SHM_SIZE    (256 * 1024)
 #define MAX_SHM_SIZE        (256 * 1024 * 1024)
-#define PUB_ACK_TIMEOUT     500 //ms
+#define PUB_ACK_TIMEOUT     50  //ms
+#define PUB_MSG_INTERVAL    10   //ms
 #define NAMED_OBJ_PREFIX    "Teleport#"
 #define MAX_SUBSCRIBERS_PER_CHANNEL 2048
 #define MAX_ID              UINT64_MAX
@@ -241,12 +242,12 @@ namespace TLP
     typedef struct _CallbackMessage
     {
         MsgType     eType;            // What kind of message
-        T_ID        nChannelId;        // From which channel
-        T_ID        nProcessId;        // From which process
+        T_ID        nChannelId;       // From which channel
+        T_ID        nProcessId;       // From which process
         T_PVOID     pData;            // Data (or NULL without data)
-        T_UINT32    nLength;        // Data length (or 0 without data)
-        T_MSG_ID    nOriginalMsgId; // Original message id
-        RC          eResult;        // RC::SUCCESS or RC::FAILED
+        T_UINT32    nLength;          // Data length (or 0 without data)
+        T_MSG_ID    nOriginalMsgId;   // Original message id
+        RC          eResult;          // RC::SUCCESS or RC::FAILED
 
     }TCbMessage, * PTCbMessage;
 
@@ -254,7 +255,7 @@ namespace TLP
     //
     typedef struct _PubMessage
     {
-        T_PVOID     pData;            // Data (or NULL without data)
+        T_PVOID     pData;          // Data (or NULL without data)
         T_UINT32    nLength;        // Data length (or 0 without data)
         T_ID        nOriginalMsgId; // Original message id  
 

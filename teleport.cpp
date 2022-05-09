@@ -475,7 +475,6 @@ CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T
         LogVital("CChannel: Failed to create CChannelData object!");
     }
     m_hStopEvent = hStopEvent;
-    m_pEventReadDone->Post(T_FALSE);
     Start();
 }
 
@@ -768,12 +767,13 @@ RC CChannel::RunPubThread()
 {
     TPubMessage msg;
     LogInfo("Channel %s(#%d) RunPubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 1) && !m_bStopped)
+    // PUB_MSG_INTERVAL will affect the response efficiency on stop event
+    // Also, affect the speed publishing messages & CPU usage
+    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, PUB_MSG_INTERVAL) && !m_bStopped)
     {
         if (m_qPubQueue.Size() > 0)
         {
             RC rc = m_pChannelData->Lock();
-            CHK_RC(rc);
             if (m_qPubQueue.Pop(msg))
             {
                 WriteMsg(msg);
@@ -781,10 +781,6 @@ RC CChannel::RunPubThread()
             rc = m_pChannelData->Unlock();
             CHK_RC(rc);
             SAFE_FREE_POINTER(msg.pData);
-        }
-        else
-        {
-            TSleep(10);
         }
     }
     LogInfo("Channel %s(#%d) RunPubThread() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -798,17 +794,20 @@ RC CChannel::RunSubThread()
 {
     LogInfo("Channel %s(#%d) RunSubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
     TPChannelShmHeader pHeader = m_pChannelData->GetShmHeader();
-    T_MSG_ID nLastMsgId = 0;
-    T_ID nLastProcId = 0;
+    T_MSG_ID nLastMsgId  = 0;
+    T_ID     nLastProcId = 0;
     while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
         RC rc = m_pEventSubRead->Wait(1000);
-        if (IS_SUCCESS(rc) &&
-            m_pAckRecord &&
-            (m_pAckRecord->AckFlag == ACK_FLAG::INIT) &&
-            !(nLastMsgId == pHeader->nOriginalMsgId && nLastProcId == pHeader->nOriginalProcId))
+        if (IS_SUCCESS(rc) && m_pAckRecord)
         {
-            nLastMsgId = pHeader->nOriginalMsgId;
+            //Re-entering
+            if( (m_pAckRecord->AckFlag != ACK_FLAG::INIT)||
+                (nLastMsgId == pHeader->nOriginalMsgId && nLastProcId == pHeader->nOriginalProcId) )
+            {
+                continue;
+            }
+            nLastMsgId  = pHeader->nOriginalMsgId;
             nLastProcId = pHeader->nOriginalProcId;
             ReadMsg(nLastProcId, nLastMsgId);
         }
@@ -828,9 +827,10 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
 
     if(IS_FAILED(rc))
     {
-        LogWarn("Channel %s(#%d) Read failed:rc=%d.", 
+        LogWarn("Channel %s(#%d) proc#%d Read failed:rc=%d.", 
             m_strChannelName.c_str(), 
             (T_UINT32)m_nChannelId, 
+            nProcId,
             rc);
 
         return rc;
@@ -857,31 +857,30 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
 RC CChannel::WriteMsg(TPubMessage& msg)
 {
     RC rc = m_pChannelData->Write(msg.pData, msg.nLength);
-    if (IS_SUCCESS(rc))
+    if(FAILED(rc)) 
     {
-        rc = m_pChannelData->SetUnread(msg.nOriginalMsgId, m_nProcId);
-        rc = PutCallbackMsg(MsgType::MSG_PUB_PUT, msg.nOriginalMsgId, m_nProcId);
-        rc = m_pEventSubRead->Post(T_FALSE);
-        rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
+        LogWarn("Channel data write failed: Proc#%d Message:%lld", m_nProcId, msg.nOriginalMsgId);
+        OnPubAckFailed(msg.nOriginalMsgId);
+        return rc;
+    }
+    rc = PutCallbackMsg(MsgType::MSG_PUB_PUT, msg.nOriginalMsgId, m_nProcId);
+    rc = m_pChannelData->SetUnread(msg.nOriginalMsgId, m_nProcId);
+    rc = m_pEventSubRead->Post(T_FALSE);
+    rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
 
+    if (IS_FAILED(rc))
+    {
+        LogWarn("Read done failed: Proc#%d Message:%lld, try again...", m_nProcId, msg.nOriginalMsgId);
+        m_pChannelData->DumpUnread();
+        rc = m_pEventSubRead->Post(T_TRUE);
+        rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
         if (IS_FAILED(rc))
         {
-            rc = m_pEventSubRead->Post(T_TRUE);
-            rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
-            if (IS_FAILED(rc))
-            {
-                rc = OnPubAckFailed(msg.nOriginalMsgId);
-            }
-            else
-            {
-                m_pEventReadDone->Reset();
-            }
-        }
-        else
-        {
-            m_pEventReadDone->Reset();
+            LogWarn("Read done failed again: Proc#%d Message:%lld, give up.", m_nProcId, msg.nOriginalMsgId);
+            rc = OnPubAckFailed(msg.nOriginalMsgId);
         }
     }
+    m_pEventReadDone->Reset();
     return rc;
 }
 
@@ -891,9 +890,9 @@ RC CChannel::RunCallback()
 {
     TCbMessage msg;
     LogInfo("Channel %s(#%d) RunCallback() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 1) && !m_bStopped)
+    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
-        RC rc = m_pEventCallback->Wait(500);
+        RC rc = m_pEventCallback->Wait(1000);
         {
             while (m_pCallback && m_qCallbackQueue.Pop(msg))
             {
@@ -976,7 +975,7 @@ RC CChannelData::Write(T_PCVOID pData, T_UINT32 nSizeInByte)
     //}
     TTRY
     {
-        memcpy_s(m_pShmDataAddr, sizeof(T_UINT32), &nSizeInByte, sizeof(T_UINT32));
+        *((T_PUINT32)m_pShmDataAddr) = nSizeInByte;
         memcpy_s(m_pShmDataAddr + sizeof(T_UINT32),
             nShmSize,
             pData,
@@ -1080,8 +1079,8 @@ TPAckRecord CChannelData::GetFirstAvailRecord()
 T_BOOL CChannelData::SetRead()
 {
     ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
-    InterlockedDecrement16(&m_pChannelHeader->nUnreadCnt);
-    T_SHORT n = InterlockedCompareExchange16(&m_pChannelHeader->nUnreadCnt, 0, 0);
+    m_pChannelHeader->nUnreadCnt--;
+    T_SHORT n = m_pChannelHeader->nUnreadCnt;
     if (n < 0) 
     {
         LogError("nUnreadCnt less than 0!");
@@ -1093,9 +1092,8 @@ T_BOOL CChannelData::SetRead()
 //
 RC CChannelData::SetUnread(T_MSG_ID nMsgId, T_ID nProcId)
 {
-    //ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
     m_pChannelHeader->nOriginalProcId = nProcId;
-    m_pChannelHeader->nOriginalMsgId = nMsgId;
+    m_pChannelHeader->nOriginalMsgId  = nMsgId;
     TPAckRecord pRecord = m_pChannelHeader->AckRecords;
     for (T_USHORT i = 0; i < m_pChannelHeader->nSubscribers; i++)
     {
@@ -1109,8 +1107,31 @@ RC CChannelData::SetUnread(T_MSG_ID nMsgId, T_ID nProcId)
         }
         pRecord++;
     }
-    
-    InterlockedExchange16(&m_pChannelHeader->nUnreadCnt, m_pChannelHeader->nSubscribers);
+    m_pChannelHeader->nUnreadCnt = m_pChannelHeader->nSubscribers;
+    return RC::SUCCESS;
+}
+
+
+//
+RC CChannelData::DumpUnread()
+{
+    LogWarn("Unread process count:%d", m_pChannelHeader->nUnreadCnt);
+    TPAckRecord pRecord = m_pChannelHeader->AckRecords;
+    for (T_USHORT i = 0; i < m_pChannelHeader->nSubscribers; i++)
+    {
+        if (pRecord->ProcId)
+        {
+            if(pRecord->AckFlag == ACK_FLAG::INIT)
+            {
+                LogWarn("Proc:%d not read yet.", pRecord->ProcId);
+            }
+        }
+        else
+        {
+            i--;
+        }
+        pRecord++;
+    }
     return RC::SUCCESS;
 }
 

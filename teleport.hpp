@@ -66,6 +66,7 @@ namespace TLP
         TPAckRecord           GetFirstAvailRecord();
         T_BOOL                SetRead();
         RC                    SetUnread(T_MSG_ID nMsgId, T_ID nProcId);
+        RC                    DumpUnread();
         RC                    IncDecSubscriber(T_BOOL bIncrease);
 
     protected:
