@@ -226,7 +226,7 @@ namespace TLP
     {
     public:
         //
-        // strChannelName [IN]: Arbitrary ansic string indicating the channel, without slash "\\". 
+        // strChannelName [IN]: Arbitrary ansic string indicating the channel, no slash "\\". 
         //                      no more than MAX_NAME(128) characters.
         // 
         // eOpenFlag [IN]:        Bit wise flag indicating the purpose openning this channel:
