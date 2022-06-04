@@ -4,10 +4,10 @@
 using namespace TLP;
 using namespace std;
 
-T_UINT32                 g_nMsgRecieved = 0;
+T_UINT32                 g_nMsgRecieved    = 0;
 T_UINT32                 g_nMixMsgRecieved = 0;
 T_ID                     g_MixChannelId;
-std::map<T_ID, T_MSG_ID> g_proc2msgid;
+std::map<T_ID, T_MSG_ID> g_Proc2MsgId;
 
 
 //
@@ -20,12 +20,20 @@ RC OnMessage(PTCbMessage pMessage)
     switch(pMessage->eType)
     {
     case MsgType::MSG_PUB_PUT:
-        LogInfo("Put Message(#%lld) Message_%d_%d to shared memory by channel(%d) process(%d)", pMessage->nOriginalMsgId, pMessage->nProcessId, pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId);
+        LogInfo("Put Message(#%lld) Message_%d_%d to shared memory by channel(%d) process(%d)", 
+            pMessage->nOriginalMsgId, 
+            pMessage->nProcessId, 
+            pMessage->nOriginalMsgId, 
+            pMessage->nChannelId, 
+            pMessage->nProcessId);
         break;
     case MsgType::MSG_PUB_ACK:
         if (IS_FAILED(pMessage->eResult)) 
         {
-            LogError("Message(#%lld was NOT acknowldeged by channel(%d) process(%d)", pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId);
+            LogError("Message(#%lld was NOT acknowldeged by channel(%d) process(%d)", 
+                pMessage->nOriginalMsgId, 
+                pMessage->nChannelId, 
+                pMessage->nProcessId);
         }
          break;
     case MsgType::MSG_SUB_GET:
@@ -35,19 +43,25 @@ RC OnMessage(PTCbMessage pMessage)
         }
         else 
         {
-            if (g_proc2msgid.find(pMessage->nProcessId) == g_proc2msgid.end())
+            if (g_Proc2MsgId.find(pMessage->nProcessId) == g_Proc2MsgId.end())
             {
-                g_proc2msgid[pMessage->nProcessId] = 0;
+                g_Proc2MsgId[pMessage->nProcessId] = 0;
             }
             g_nMsgRecieved++;
 
-            if (pMessage->nOriginalMsgId != g_proc2msgid[pMessage->nProcessId] + 1)
+            if (pMessage->nOriginalMsgId != g_Proc2MsgId[pMessage->nProcessId] + 1)
             {
-                LogError("Inconsistency detected:LastMsg:%lld MsgId:%lld", g_proc2msgid[pMessage->nProcessId], pMessage->nOriginalMsgId);
+                LogError("Inconsistency detected:LastMsg:%lld MsgId:%lld", 
+                    g_Proc2MsgId[pMessage->nProcessId],
+                    pMessage->nOriginalMsgId);
             }
-            g_proc2msgid[pMessage->nProcessId] = pMessage->nOriginalMsgId;
+            g_Proc2MsgId[pMessage->nProcessId] = pMessage->nOriginalMsgId;
         }
-        LogInfo("Got message(#%lld) from channel(%d) process(%d):%s", pMessage->nOriginalMsgId, pMessage->nChannelId, pMessage->nProcessId, pMessage->pData);
+        LogInfo("Got message(#%lld) from channel(%d) process(%d):%s", 
+            pMessage->nOriginalMsgId, 
+            pMessage->nChannelId, 
+            pMessage->nProcessId, 
+            pMessage->pData);
         break;
     default:
         LogError("Invalid message recieved.");
@@ -137,7 +151,10 @@ T_VOID SendMessageToTopic(T_PCSTR  pTopic, T_UINT32 nMsg, T_BOOL bGlobal = T_FAL
 
 
 //
-T_VOID SendMessageToTopicAndListen(T_PCSTR  pTopic, T_UINT32 nMsg, T_UINT32 nTotalMsg, T_BOOL bGlobal = T_FALSE)
+T_VOID SendMessageToTopicAndListen(T_PCSTR  pTopic, 
+    T_UINT32 nMsg, 
+    T_UINT32 nTotalMsg, 
+    T_BOOL bGlobal = T_FALSE)
 {
     g_MixChannelId = 0;
     RC rc = ITeleport::Open(pTopic,

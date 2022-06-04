@@ -222,7 +222,7 @@ namespace TLP
 
 
     //
-    interface ITeleport
+    class ITeleport
     {
     public:
         //
