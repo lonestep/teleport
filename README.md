@@ -2,8 +2,9 @@
 
 # Teleport
 
-The efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
-一个跨进程通讯的高效、跨平台、优美的、基于共享内存的本地C++实现。
+* The efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
+
+* 一个跨进程通讯的高效、跨平台、优美的、基于共享内存的本地C++实现。
 
 # Features
 
@@ -95,9 +96,12 @@ RC OnMessage(PTCbMessage pMessage)
 * 将下列代码放到项目的相应地方：
 ```cpp
     // Open the channel with CH_LISTEN flag in your listening process:
+    // 在你的订阅进程用CH_LISTEN标记打开频道
     T_ID nChannelId = 0;
     //  strTopic: Arbitrary ansic string indicating the channel, no slash "\\", no more than MAX_NAME(128) characters.
     //  ref. to teleport.hpp for more.
+    //  strTopic: 任意ASCII字符串，不包括反斜杠"\\"，不能超过128字符。
+    //  参考 teleport.hpp 
     RC rc = ITeleport::Open( strTopic,
         CH_LISTEN | CH_CREATE_IF_NOEXIST,
         nChannelId,
@@ -105,13 +109,15 @@ RC OnMessage(PTCbMessage pMessage)
         bGlobal);
     if(IS_FAILED(rc))
     {
-      // Audit the failure
+      // Audit the failure 记录失败
     }
     
     // Now you can do your own things,  OnMessage will get called on messsage recieved
+    // 现在你可以干自己的事啦，当消息到达回调OnMessage将会被调用
     ...
     
     // Close Channel on your proces/thread exit
+    // 当你的进程/线程退出，关闭频道
     rc = ITeleport::Close(nChannelId, T_TRUE);
     
     
@@ -119,6 +125,7 @@ RC OnMessage(PTCbMessage pMessage)
 ---
 ```
     // From the sending process, you open a channel with CH_SEND flag:
+    // 发送进程里用CH_SEND标记打开一个频道
     T_ID nChannelId = 0;
     RC rc = ITeleport::Open( strTopic,
         CH_SEND | CH_CREATE_IF_NOEXIST,
@@ -128,14 +135,17 @@ RC OnMessage(PTCbMessage pMessage)
     if(IS_SUCCESS(rc))
     {
       // You can call ITeleport::Send() multiple times for the same nChannelId
+      // 有了频道ID，你可以重复调用ITeleport::Send()往该频道发送消息
       rc = ITeleport::Send(nChannelId, (T_PVOID)strMsg.c_str(), (T_UINT32)strMsg.length());
     }
     ...
     // Remember to close the channel on process/thread exit
+    // 当进程、线程退出，记得关闭频道
     rc = ITeleport::Close(nChannelId, T_TRUE);
 ```
 # License
 
 Copyright (c) lonestep. All rights reserved.
+MIT许可版权声明
 
 Licensed under the [MIT](https://github.com/lonestep/teleport/blob/master/LICENSE) License.
