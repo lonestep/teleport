@@ -7,13 +7,18 @@
 *    Created:
 */
 #pragma once
+
+#ifdef Windows
 #include <windows.h>
+#else
+#include <sys/types.h>
+#include <pthread.h>
+#endif
+
+
 namespace TLP
 {
 #ifdef Windows
-
-
-
     typedef HANDLE          T_HANDLE;
     typedef PSTR            T_PSTR;
     typedef PTSTR           T_PTSTR;
@@ -75,21 +80,103 @@ namespace TLP
     }}
 #define TTRY  __try
 #define TEXCEPT_EXECUTE_HANDLER __except(EXCEPTION_EXECUTE_HANDLER)
+#define T_SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES
+#define T_CRITICAL_SECTION CRITICAL_SECTION
+
+#else //*NIX OS
+
+    typedef int32_t           T_HANDLE;
+#ifdef UNICODE
+    typedef wchar_t           T_CHAR;
+    typedef unsigned wchar_t  T_UCHAR;
+#else
+    typedef char              T_CHAR;
+    typedef unsigned char     T_UCHAR;
 #endif
+    typedef char*             T_PSTR;
+    typedef T_CHAR*           T_PTSTR;
+    typedef const char*       T_PCSTR;
+
+    typedef const T_CHAR      T_CCHAR;
+    typedef T_CHAR*           T_PCHAR;
+    typedef T_CCHAR*          T_PCCHAR;
+
+    typedef T_UCHAR*          T_PUCHAR;
+    typedef const T_UCHAR     T_CUCHAR;
+    typedef T_CUCHAR*         T_PCUCHAR;
+    typedef T_UCHAR           T_BOOL;
+    typedef int16_t           T_SHORT;
+    typedef T_SHORT*          T_PSHORT;
+    typedef uint32_t          T_UINT32;
+    typedef int32_t           T_INT32;
+    typedef int32_t*          T_PINT32;
+    typedef uint64_t          T_UINT64;
+    typedef T_UINT32*         T_PUINT32;
+    typedef T_UINT64*         T_PUINT64;
+    typedef unsigned long     T_ULONG;
+    typedef long              T_LONG;
+    typedef T_ULONG*          T_PULONG;
+    typedef uint16_t          T_USHORT;
+    typedef void              T_VOID;
+    typedef const void*       T_PCVOID;
+    typedef void*             T_PVOID;
+    typedef char              T_CHAR;
+    typedef std::string       T_STRING;
+
+#define I64_FMT         "%lld"
+#define T_INVHDL        -1
+#define T_VALHDL        1
+#define T_FALSE         false
+#define T_TRUE          true
+#define T_NULL          NULL
+#define IS_SUCCESS(_x)  ((_x) == RC::SUCCESS)
+#define IS_FAILED(_x)   ((_x) != RC::SUCCESS)
+#define CHK_RC(_rc)     {if(IS_FAILED(_rc)){LogError("%s(line %d) rc:%d", __FILE__, __LINE__, _rc);return _rc;}}
+#define SAFE_CLOSE_HANDLE(_h)        \
+    {if (_h != T_INVHDL)             \
+    {                                \
+        close(_h);             \
+        _h = T_INVHDL;               \
+    }}
+
+#define SAFE_DELETE_OBJ(_o)          \
+    {if (_o != T_NULL)               \
+    {                                \
+        delete(_o);                  \
+        _o = T_NULL;                 \
+    }}
+
+#define SAFE_FREE_POINTER(_p)        \
+    {if (_p != T_NULL)               \
+    {                                \
+        free(_p);                    \
+        _p = T_NULL;                 \
+    }}
+#define TTRY                     /*nothing*/
+#define TEXCEPT_EXECUTE_HANDLER  /*nothing*/
+#define PAGE_READONLY            0x2
+#define PAGE_READWRITE           0x4
+#define T_SECURITY_ATTRIBUTES    pthread_mutexattr_t
+#define INFINITE                 999999
+#define T_CRITICAL_SECTION       pthread_mutex_t
+
+#endif // #if Windows
 
 
     // c++03: >=199711L/c++11: >=201103L/c++14: >=201402L/c++17: >=201703L/c++20: >=201704L 
 #if (__cplusplus >= 201103L)
+
     constexpr T_USHORT MAX_GUID = 64;
     constexpr T_USHORT MAX_NAME = 128;
     constexpr T_USHORT MAX_BUFFER_LEN = 256;
-    constexpr T_USHORT DEFAULT_SHM_SIZE = 256 * 1024;
-    constexpr T_USHORT MAX_SHM_SIZE = 256 * 1024 * 1024;
+    constexpr T_UINT32 DEFAULT_SHM_SIZE = 256u * 1024u;
+    constexpr T_UINT32 MAX_SHM_SIZE = 256 * 1024 * 1024;
     constexpr T_USHORT PUB_ACK_TIMEOUT = 500;//ms
-    constexpr T_PSTR   NAMED_OBJ_PREFIX = "Teleport#";
+    constexpr T_PCSTR  NAMED_OBJ_PREFIX = "Teleport#";
     constexpr T_USHORT MAX_SUBSCRIBERS_PER_CHANNEL = 2048;
     constexpr T_UINT64 MAX_ID = UINT64_MAX;
 #else
+
 #define MAX_GUID            64
 #define MAX_NAME            128
 #define MAX_BUFFER_LEN      256
@@ -101,7 +188,7 @@ namespace TLP
 #define MAX_SUBSCRIBERS_PER_CHANNEL 2048
 #define MAX_ID              UINT64_MAX
 
-#endif
+#endif //if (__cplusplus >= 201103L)
 
     typedef T_UINT64                        T_MSG_ID;
     typedef T_PUINT64                       T_PMSG_ID;
@@ -283,7 +370,7 @@ namespace TLP
 #define GLOBAL_STR       "Global\\"
 #define GLOBAL_SUFFIX_0  "\\0"
 #define GLOBAL_SUFFIX_1  "\\1"
-#define LOG_DIR             "TlpLog"
+#define LOG_DIR          "TlpLog"
 #define SHOULD_BE_TRUE(_x)                                                                    \
 {                                                                                            \
 std::cout.setf(ios::left);                                                                    \
