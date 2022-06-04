@@ -2,7 +2,8 @@
 
 # Teleport
 
-The fastest, cross-platform, native C++ IPC(Inter-Process Communication) library that base on shared memory. 
+The efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
+一个跨进程通讯的高效、跨平台、优美的、基于共享内存的本地C++实现。
 
 # Features
 
@@ -12,22 +13,39 @@ The fastest, cross-platform, native C++ IPC(Inter-Process Communication) library
 * Efficient and elegant.
 * Support all kinds of STL versions/old IDEs.
 
+* 多发送者和接受者。
+* 发送失败确认。
+* 不引入额外依赖。
+* 高效优美。
+* 支持旧版本开发环境和STL库。
+
 # Build
-* You don't need to build it into library, use the 5 source files:
+* You don't need to build it into library, use the 5 source files insdead:
   * platform.*
   * teleport.*
   * typedefs.hpp
 * If you wanna build unittest, open teleport directory with Visual Studio, CMake 3.8+ is required.
 * Or use cmake command on *Nix like system.
 
+* 无需编译成库，直接用下面5个源文件：
+  * platform.*
+  * teleport.*
+  * typedefs.hpp
+* 如果你想生成单元测试程序，用Visual Studio直接打开teleport目录用CMake生成即可。（生成需要CMake 3.8以上）
+* 对于类unix系统，用cmake生成。
 # Getting Started
 
 * Add the following files into your project:
   * platform.*
   * teleport.*
   * typedefs.hpp
+* 将下列文件加到你的项目:
+  * platform.*
+  * teleport.*
+  * typedefs.hpp
 ---
 * Create a OnMessage callback to handle the notification(s), here's an example:
+* 创建一个OnMessage回调来处理回调消息，这是例子：
 ``` cpp
 // MSG_PUB_PUT = 0,   // When message was put to shared memory
 // MSG_PUB_ACK,       // When message has been acknowleged by remote process
@@ -74,6 +92,7 @@ RC OnMessage(PTCbMessage pMessage)
 ```
 ---
 * Add the following codes to your project respectively:
+* 将下列代码放到项目的相应地方：
 ```cpp
     // Open the channel with CH_LISTEN flag in your listening process:
     T_ID nChannelId = 0;
