@@ -4,7 +4,7 @@
 
 * The efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
 
-* Ò»¸ö¿ç½ø³ÌÍ¨Ñ¶µÄ¸ßĞ§¡¢¿çÆ½Ì¨¡¢ÓÅÃÀµÄ¡¢»ùÓÚ¹²ÏíÄÚ´æµÄ±¾µØC++ÊµÏÖ¡£
+* ä¸€ä¸ªè·¨è¿›ç¨‹é€šè®¯çš„é«˜æ•ˆã€è·¨å¹³å°ã€ä¼˜ç¾çš„ã€åŸºäºå…±äº«å†…å­˜çš„æœ¬åœ°C++å®ç°ã€‚
 
 # Features
 
@@ -14,39 +14,39 @@
 * Efficient and elegant.
 * Support all kinds of STL versions/old IDEs.
 
-* ¶à·¢ËÍÕßºÍ½ÓÊÜÕß¡£
-* ·¢ËÍÊ§°ÜÈ·ÈÏ¡£
-* ²»ÒıÈë¶îÍâÒÀÀµ¡£
-* ¸ßĞ§ÓÅÃÀ¡£
-* Ö§³Ö¾É°æ±¾¿ª·¢»·¾³ºÍSTL¿â¡£
+* å¤šå‘é€è€…å’Œæ¥å—è€…ã€‚
+* å‘é€å¤±è´¥ç¡®è®¤ã€‚
+* ä¸å¼•å…¥é¢å¤–ä¾èµ–ã€‚
+* é«˜æ•ˆä¼˜ç¾ã€‚
+* æ”¯æŒæ—§ç‰ˆæœ¬å¼€å‘ç¯å¢ƒå’ŒSTLåº“ã€‚
 
 # Build
-* You don't need to build it into library, use the 5 source files insdead:
+* You don't need to build it into library, use the 5 source files instead:
   * platform.*
   * teleport.*
   * typedefs.hpp
 * If you wanna build unittest, open teleport directory with Visual Studio, CMake 3.8+ is required.
 * Or use cmake command on *Nix like system.
 
-* ÎŞĞè±àÒë³É¿â£¬Ö±½ÓÓÃÏÂÃæ5¸öÔ´ÎÄ¼ş£º
+* æ— éœ€ç¼–è¯‘æˆåº“ï¼Œç›´æ¥ç”¨ä¸‹é¢5ä¸ªæºæ–‡ä»¶ï¼š
   * platform.*
   * teleport.*
   * typedefs.hpp
-* Èç¹ûÄãÏëÉú³Éµ¥Ôª²âÊÔ³ÌĞò£¬ÓÃVisual StudioÖ±½Ó´ò¿ªteleportÄ¿Â¼ÓÃCMakeÉú³É¼´¿É¡££¨Éú³ÉĞèÒªCMake 3.8ÒÔÉÏ£©
-* ¶ÔÓÚÀàunixÏµÍ³£¬ÓÃcmakeÉú³É¡£
+* å¦‚æœä½ æƒ³ç”Ÿæˆå•å…ƒæµ‹è¯•ç¨‹åºï¼Œç”¨Visual Studioç›´æ¥æ‰“å¼€teleportç›®å½•ç”¨CMakeç”Ÿæˆå³å¯ã€‚ï¼ˆç”Ÿæˆéœ€è¦CMake 3.8ä»¥ä¸Šï¼‰
+* å¯¹äºç±»unixç³»ç»Ÿï¼Œç”¨cmakeç”Ÿæˆã€‚
 # Getting Started
 
 * Add the following files into your project:
   * platform.*
   * teleport.*
   * typedefs.hpp
-* ½«ÏÂÁĞÎÄ¼ş¼Óµ½ÄãµÄÏîÄ¿:
+* å°†ä¸‹åˆ—æ–‡ä»¶åŠ åˆ°ä½ çš„é¡¹ç›®:
   * platform.*
   * teleport.*
   * typedefs.hpp
 ---
 * Create a OnMessage callback to handle the notification(s), here's an example:
-* ´´½¨Ò»¸öOnMessage»Øµ÷À´´¦Àí»Øµ÷ÏûÏ¢£¬ÕâÊÇÀı×Ó£º
+* åˆ›å»ºä¸€ä¸ªOnMessageå›è°ƒæ¥å¤„ç†å›è°ƒæ¶ˆæ¯ï¼Œè¿™æ˜¯ä¾‹å­ï¼š
 ``` cpp
 // MSG_PUB_PUT = 0,   // When message was put to shared memory
 // MSG_PUB_ACK,       // When message has been acknowleged by remote process
@@ -93,15 +93,15 @@ RC OnMessage(PTCbMessage pMessage)
 ```
 ---
 * Add the following codes to your project respectively:
-* ½«ÏÂÁĞ´úÂë·Åµ½ÏîÄ¿µÄÏàÓ¦µØ·½£º
+* å°†ä¸‹åˆ—ä»£ç æ”¾åˆ°é¡¹ç›®çš„ç›¸åº”åœ°æ–¹ï¼š
 ```cpp
     // Open the channel with CH_LISTEN flag in your listening process:
-    // ÔÚÄãµÄ¶©ÔÄ½ø³ÌÓÃCH_LISTEN±ê¼Ç´ò¿ªÆµµÀ
+    // åœ¨ä½ çš„è®¢é˜…è¿›ç¨‹ç”¨CH_LISTENæ ‡è®°æ‰“å¼€é¢‘é“
     T_ID nChannelId = 0;
     //  strTopic: Arbitrary ansic string indicating the channel, no slash "\\", no more than MAX_NAME(128) characters.
     //  ref. to teleport.hpp for more.
-    //  strTopic: ÈÎÒâASCII×Ö·û´®£¬²»°üÀ¨·´Ğ±¸Ü"\\"£¬²»ÄÜ³¬¹ı128×Ö·û¡£
-    //  ²Î¿¼ teleport.hpp 
+    //  strTopic: ä»»æ„ASCIIå­—ç¬¦ä¸²ï¼Œä¸åŒ…æ‹¬åæ–œæ "\\"ï¼Œä¸èƒ½è¶…è¿‡128å­—ç¬¦ã€‚
+    //  å‚è€ƒ teleport.hpp 
     RC rc = ITeleport::Open( strTopic,
         CH_LISTEN | CH_CREATE_IF_NOEXIST,
         nChannelId,
@@ -109,15 +109,15 @@ RC OnMessage(PTCbMessage pMessage)
         bGlobal);
     if(IS_FAILED(rc))
     {
-      // Audit the failure ¼ÇÂ¼Ê§°Ü
+      // Audit the failure è®°å½•å¤±è´¥
     }
     
     // Now you can do your own things,  OnMessage will get called on messsage recieved
-    // ÏÖÔÚÄã¿ÉÒÔ¸É×Ô¼ºµÄÊÂÀ²£¬µ±ÏûÏ¢µ½´ï»Øµ÷OnMessage½«»á±»µ÷ÓÃ
+    // ç°åœ¨ä½ å¯ä»¥å¹²è‡ªå·±çš„äº‹å•¦ï¼Œå½“æ¶ˆæ¯åˆ°è¾¾å›è°ƒOnMessageå°†ä¼šè¢«è°ƒç”¨
     ...
     
     // Close Channel on your proces/thread exit
-    // µ±ÄãµÄ½ø³Ì/Ïß³ÌÍË³ö£¬¹Ø±ÕÆµµÀ
+    // å½“ä½ çš„è¿›ç¨‹/çº¿ç¨‹é€€å‡ºï¼Œå…³é—­é¢‘é“
     rc = ITeleport::Close(nChannelId, T_TRUE);
     
     
@@ -125,7 +125,7 @@ RC OnMessage(PTCbMessage pMessage)
 ---
 ```
     // From the sending process, you open a channel with CH_SEND flag:
-    // ·¢ËÍ½ø³ÌÀïÓÃCH_SEND±ê¼Ç´ò¿ªÒ»¸öÆµµÀ
+    // å‘é€è¿›ç¨‹é‡Œç”¨CH_SENDæ ‡è®°æ‰“å¼€ä¸€ä¸ªé¢‘é“
     T_ID nChannelId = 0;
     RC rc = ITeleport::Open( strTopic,
         CH_SEND | CH_CREATE_IF_NOEXIST,
@@ -135,17 +135,17 @@ RC OnMessage(PTCbMessage pMessage)
     if(IS_SUCCESS(rc))
     {
       // You can call ITeleport::Send() multiple times for the same nChannelId
-      // ÓĞÁËÆµµÀID£¬Äã¿ÉÒÔÖØ¸´µ÷ÓÃITeleport::Send()Íù¸ÃÆµµÀ·¢ËÍÏûÏ¢
+      // æœ‰äº†é¢‘é“IDï¼Œä½ å¯ä»¥é‡å¤è°ƒç”¨ITeleport::Send()å¾€è¯¥é¢‘é“å‘é€æ¶ˆæ¯
       rc = ITeleport::Send(nChannelId, (T_PVOID)strMsg.c_str(), (T_UINT32)strMsg.length());
     }
     ...
     // Remember to close the channel on process/thread exit
-    // µ±½ø³Ì¡¢Ïß³ÌÍË³ö£¬¼ÇµÃ¹Ø±ÕÆµµÀ
+    // å½“è¿›ç¨‹ã€çº¿ç¨‹é€€å‡ºï¼Œè®°å¾—å…³é—­é¢‘é“
     rc = ITeleport::Close(nChannelId, T_TRUE);
 ```
 # License
 
 Copyright (c) lonestep. All rights reserved.
-MITĞí¿É°æÈ¨ÉùÃ÷
+MITè®¸å¯ç‰ˆæƒå£°æ˜
 
 Licensed under the [MIT](https://github.com/lonestep/teleport/blob/master/LICENSE) License.
