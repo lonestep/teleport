@@ -2,7 +2,7 @@
 
 # Teleport
 
-* The efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
+* An efficient, cross-platform, elegant, native C++ IPC(Inter-Process Communication) implementation that base on shared memory. 
 
 * 一个跨进程通讯的高效、跨平台、优美的、基于共享内存的本地C++实现。
 
