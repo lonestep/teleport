@@ -1,5 +1,4 @@
 #include <iostream>
-#include <chrono>
 #include "teleport.hpp"
 
 using namespace TLP;
@@ -452,6 +451,19 @@ static RC StressTestCallback(PTCbMessage pMessage)
 
 
 //
+static inline T_UINT64 GetTimeMs()
+{
+#ifdef Windows
+    return (T_UINT64)::GetTickCount64();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (T_UINT64)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+#endif
+}
+
+
+//
 T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
 {
     g_nStressRecvCount = 0;
@@ -477,7 +489,7 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
     printf("Starting stress test: %u messages...\n", nTotalMessages);
     fflush(stdout);
 
-    auto tStartTime = std::chrono::steady_clock::now();
+    T_UINT64 tStartTime = GetTimeMs();
     T_UINT32 nLastReport = 0;
 
     for (T_UINT32 i = 1; i <= nTotalMessages; i++)
@@ -505,11 +517,10 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
 
         if (i - nLastReport >= 200000 || i == nTotalMessages)
         {
-            auto tNow = std::chrono::steady_clock::now();
-            auto nElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - tStartTime).count();
+            T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
-            printf("Progress: Sent %u / %u | Received: %u | Elapsed: %lld ms (%.0f msg/s)\n",
-                i, nTotalMessages, g_nStressRecvCount, (long long)nElapsed, (double)g_nStressRecvCount * 1000.0 / nElapsed);
+            printf("Progress: Sent %u / %u | Received: %u | Elapsed: %llu ms (%.0f msg/s)\n",
+                i, nTotalMessages, g_nStressRecvCount, (unsigned long long)nElapsed, (double)g_nStressRecvCount * 1000.0 / nElapsed);
             fflush(stdout);
             nLastReport = i;
         }
@@ -521,11 +532,10 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
         TSleep(50);
         if (g_nStressRecvCount - nLastReport >= 200000 || g_nStressRecvCount == nTotalMessages)
         {
-            auto tNow = std::chrono::steady_clock::now();
-            auto nElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - tStartTime).count();
+            T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
-            printf("Waiting: Received %u / %u | Elapsed: %lld ms (%.0f msg/s)\n",
-                g_nStressRecvCount, nTotalMessages, (long long)nElapsed, (double)g_nStressRecvCount * 1000.0 / nElapsed);
+            printf("Waiting: Received %u / %u | Elapsed: %llu ms (%.0f msg/s)\n",
+                g_nStressRecvCount, nTotalMessages, (unsigned long long)nElapsed, (double)g_nStressRecvCount * 1000.0 / nElapsed);
             fflush(stdout);
             nLastReport = g_nStressRecvCount;
         }
@@ -536,8 +546,7 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
     rc = ITeleport::Close(nSubChannelId, T_TRUE);
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
-    auto tEndTime = std::chrono::steady_clock::now();
-    auto nTotalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tEndTime - tStartTime).count();
+    T_UINT64 nTotalElapsed = GetTimeMs() - tStartTime;
     if (nTotalElapsed == 0) nTotalElapsed = 1;
     T_UINT32 nLostCount = nTotalMessages - g_nStressRecvCount;
 
@@ -546,7 +555,7 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
     printf("Total Messages Received: %u\n", g_nStressRecvCount);
     printf("Lost Messages:           %u\n", nLostCount);
     printf("Order Errors:            %u\n", g_nStressOrderErrorCount);
-    printf("Elapsed Time:            %lld ms (%.2f s)\n", (long long)nTotalElapsed, (double)nTotalElapsed / 1000.0);
+    printf("Elapsed Time:            %llu ms (%.2f s)\n", (unsigned long long)nTotalElapsed, (double)nTotalElapsed / 1000.0);
     printf("Throughput:              %.0f msg/s\n", (double)g_nStressRecvCount * 1000.0 / nTotalElapsed);
     printf("====================================================\n\n");
 
@@ -614,7 +623,7 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
     printf("MP Listener ready on topic '%s', expecting %u messages...\n", pTopic, nTotalMsg);
     fflush(stdout);
 
-    auto tStartTime = std::chrono::steady_clock::now();
+    T_UINT64 tStartTime = GetTimeMs();
     T_BOOL bStarted = T_FALSE;
     T_UINT32 nLastReport = 0;
     T_UINT32 nWaitLoops = 20000; // up to 1000s
@@ -625,15 +634,14 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
         if (g_nMPTotalRecv > 0 && !bStarted)
         {
             bStarted = T_TRUE;
-            tStartTime = std::chrono::steady_clock::now();
+            tStartTime = GetTimeMs();
         }
         if (g_nMPTotalRecv - nLastReport >= 200000 || (g_nMPTotalRecv > 0 && g_nMPTotalRecv == nTotalMsg))
         {
-            auto tNow = std::chrono::steady_clock::now();
-            auto nElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - tStartTime).count();
+            T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
-            printf("MP Listener: Received %u / %u | Elapsed: %lld ms (%.0f msg/s)\n",
-                g_nMPTotalRecv, nTotalMsg, (long long)nElapsed, (double)g_nMPTotalRecv * 1000.0 / nElapsed);
+            printf("MP Listener: Received %u / %u | Elapsed: %llu ms (%.0f msg/s)\n",
+                g_nMPTotalRecv, nTotalMsg, (unsigned long long)nElapsed, (double)g_nMPTotalRecv * 1000.0 / nElapsed);
             fflush(stdout);
             nLastReport = g_nMPTotalRecv;
         }
@@ -642,8 +650,7 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
     rc = ITeleport::Close(nChannelId, T_TRUE);
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
-    auto tEndTime = std::chrono::steady_clock::now();
-    auto nTotalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tEndTime - tStartTime).count();
+    T_UINT64 nTotalElapsed = GetTimeMs() - tStartTime;
     if (nTotalElapsed == 0) nTotalElapsed = 1;
     T_UINT32 nLostCount = nTotalMsg - g_nMPTotalRecv;
 
@@ -657,7 +664,7 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
     {
         printf("  - Sender ID %u: %u messages received\n", it.first, it.second);
     }
-    printf("Elapsed Time:            %lld ms (%.2f s)\n", (long long)nTotalElapsed, (double)nTotalElapsed / 1000.0);
+    printf("Elapsed Time:            %llu ms (%.2f s)\n", (unsigned long long)nTotalElapsed, (double)nTotalElapsed / 1000.0);
     printf("Throughput:              %.0f msg/s\n", (double)g_nMPTotalRecv * 1000.0 / nTotalElapsed);
     printf("=============================================================\n\n");
 }
@@ -688,7 +695,7 @@ T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
     printf("MP Sender %u started: sending %u messages...\n", nSenderId, nMsgCount);
     fflush(stdout);
 
-    auto tStartTime = std::chrono::steady_clock::now();
+    T_UINT64 tStartTime = GetTimeMs();
     T_UINT32 nLastReport = 0;
 
     for (T_UINT32 i = 1; i <= nMsgCount; i++)
@@ -706,11 +713,10 @@ T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
 
         if (i - nLastReport >= 100000 || i == nMsgCount)
         {
-            auto tNow = std::chrono::steady_clock::now();
-            auto nElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - tStartTime).count();
+            T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
-            printf("Sender %u: Sent %u / %u | Elapsed: %lld ms (%.0f msg/s)\n",
-                nSenderId, i, nMsgCount, (long long)nElapsed, (double)i * 1000.0 / nElapsed);
+            printf("Sender %u: Sent %u / %u | Elapsed: %llu ms (%.0f msg/s)\n",
+                nSenderId, i, nMsgCount, (unsigned long long)nElapsed, (double)i * 1000.0 / nElapsed);
             fflush(stdout);
             nLastReport = i;
         }
@@ -719,11 +725,10 @@ T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
     rc = ITeleport::Close(nChannelId, T_TRUE);
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
-    auto tEndTime = std::chrono::steady_clock::now();
-    auto nTotalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tEndTime - tStartTime).count();
+    T_UINT64 nTotalElapsed = GetTimeMs() - tStartTime;
     if (nTotalElapsed == 0) nTotalElapsed = 1;
-    printf("Sender %u complete: %u msgs in %lld ms (%.0f msg/s)\n",
-        nSenderId, nMsgCount, (long long)nTotalElapsed, (double)nMsgCount * 1000.0 / nTotalElapsed);
+    printf("Sender %u complete: %u msgs in %llu ms (%.0f msg/s)\n",
+        nSenderId, nMsgCount, (unsigned long long)nTotalElapsed, (double)nMsgCount * 1000.0 / nTotalElapsed);
     fflush(stdout);
 }
 
