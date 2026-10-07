@@ -7,7 +7,8 @@ import threading
 import json
 import re
 
-LOG_DIR = "/home/shawn/src/teleport/benchmark_logs"
+LOG_DIR = "/tmp/teleport_bench_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
 def get_system_specs():
     specs = {}
@@ -117,7 +118,7 @@ def read_teleport_process_stats():
     return proc_count, total_ticks, total_rss, total_vsz
 
 class ResourceMonitor(threading.Thread):
-    def __init__(self, interval_sec=0.25):
+    def __init__(self, interval_sec=0.05):
         super().__init__()
         self.interval = interval_sec
         self.running = True
@@ -182,22 +183,31 @@ def render_ascii_chart(values, labels=None, width=50, height=8, unit="%"):
     if max_val == min_val:
         max_val = min_val + 1.0
 
+    resampled = []
+    if len(values) == 1:
+        resampled = [values[0]] * width
+    else:
+        for col in range(width):
+            idx = col * (len(values) - 1) / (width - 1)
+            i0 = int(idx)
+            i1 = min(len(values) - 1, i0 + 1)
+            frac = idx - i0
+            val = values[i0] * (1.0 - frac) + values[i1] * frac
+            resampled.append(val)
+
     lines = []
     for r in range(height, -1, -1):
         threshold = min_val + (max_val - min_val) * (r / height)
         line_chars = []
-        for v in values:
+        for v in resampled:
             if v >= threshold:
                 line_chars.append("█")
             elif v >= threshold - (max_val - min_val) / (height * 2):
                 line_chars.append("▄")
             else:
                 line_chars.append(" ")
-        # Sample to fit width
-        step = max(1, len(line_chars) // width)
-        sampled = "".join(line_chars[i] for i in range(0, len(line_chars), step))[:width]
-        lines.append(f"{threshold:6.1f}{unit} |{sampled}")
-    
+        lines.append(f"{threshold:6.1f}{unit} |{''.join(line_chars)}")
+
     axis = " " * 8 + "+" + "-" * width
     lines.append(axis)
     return "\n".join(lines)
@@ -206,7 +216,7 @@ def main():
     print("==================================================================")
     print(" Teleport High-Concurrency Multi-Process Benchmark")
     print(" Architecture: 4 Receivers (Subscribers), 12 Senders (Publishers)")
-    print(" Workload:     2,000,000 Messages Sent | 8,000,000 Deliveries Expected")
+    print(" Workload:     20,000,000 Messages Sent | 80,000,000 Deliveries Expected")
     print("==================================================================")
     
     specs = get_system_specs()
@@ -220,7 +230,7 @@ def main():
     print(f"  Total Memory:    {mem_total_gb:.2f} GB (Available: {mem_avail_gb:.2f} GB)")
 
     # Launch Monitor
-    monitor = ResourceMonitor(interval_sec=0.25)
+    monitor = ResourceMonitor(interval_sec=0.05)
     monitor.start()
 
     print("\n[Benchmark Execution]")
@@ -230,6 +240,7 @@ def main():
     cmd = [
         "podman", "run", "--rm",
         "-v", "/home/shawn/src/teleport:/src:z",
+        "-v", "/tmp/teleport_bench_logs:/tmp/teleport_bench_logs:z",
         "-w", "/src",
         "teleport-env",
         "sh", "/src/run_mp_benchmark.sh"
@@ -352,6 +363,26 @@ def main():
 
         print("\n--- Total System Memory Used (MB) Over Time ---")
         print(render_ascii_chart(sys_mem, width=60, height=8, unit="M"))
+
+        # Print table
+        print("\n--- Detailed Resource Progression Table ---")
+        print("| Time (s) | System CPU (%) | Equivalent Cores | Group RSS (MB) | Avg RSS (MB) | Total Mem (GB) | Procs |")
+        print("|:--------:|:--------------:|:----------------:|:--------------:|:------------:|:--------------:|:-----:|")
+        n = len(monitor.records)
+        step = max(1, n // 12)
+        indices = list(range(0, n, step))
+        if (n - 1) not in indices:
+            indices.append(n - 1)
+        for idx in indices:
+            rec = monitor.records[idx]
+            t = rec["time"]
+            scpu = rec["sys_cpu_pct"]
+            cores = rec["proc_cpu_pct"] / 100.0
+            rss = rec["teleport_rss_mb"]
+            pcount = max(1, rec["teleport_procs"])
+            avg_rss = rss / pcount
+            smem = rec["mem_used_mb"] / 1024.0
+            print(f"| {t:>6.2f}s  | {scpu:>12.1f}% | {cores:>14.2f} 核 | {rss:>12.1f} MB | {avg_rss:>10.1f} MB | {smem:>12.2f} GB | {pcount:>5d} |")
 
     print("\nBenchmark raw results exported to: /home/shawn/src/teleport/benchmark_results.json")
 
