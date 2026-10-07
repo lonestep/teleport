@@ -20,7 +20,7 @@
 #include "typedefs.hpp"
 #ifdef Windows
 #include <sddl.h>
-#include <ObjBase.h>
+#include <objbase.h>
 #else
 #include <sys/time.h>
 #endif
@@ -222,11 +222,11 @@ namespace TLP
 
 
     //!!! NOTE: LogVital() will log and exit the process!
-#define LogVital(_pFormat, ...)    Logger::Instance().Log(TLP::LoggerType::LOG_VITAL, _pFormat, __VA_ARGS__)
-#define LogError(_pFormat, ...)    Logger::Instance().Log(TLP::LoggerType::LOG_ERROR, _pFormat, __VA_ARGS__)
-#define LogWarn(_pFormat, ...)     Logger::Instance().Log(TLP::LoggerType::LOG_WARNING, _pFormat, __VA_ARGS__)
-#define LogInfo(_pFormat, ...)     Logger::Instance().Log(TLP::LoggerType::LOG_INFO, _pFormat, __VA_ARGS__)
-#define LogTrivial(_pFormat, ...)  Logger::Instance().Log(TLP::LoggerType::LOG_TRIVIAL, _pFormat, __VA_ARGS__)
+#define LogVital(_pFormat, ...)    Logger::Instance().Log(TLP::LoggerType::LOG_VITAL, _pFormat, ##__VA_ARGS__)
+#define LogError(_pFormat, ...)    Logger::Instance().Log(TLP::LoggerType::LOG_ERROR, _pFormat, ##__VA_ARGS__)
+#define LogWarn(_pFormat, ...)     Logger::Instance().Log(TLP::LoggerType::LOG_WARNING, _pFormat, ##__VA_ARGS__)
+#define LogInfo(_pFormat, ...)     Logger::Instance().Log(TLP::LoggerType::LOG_INFO, _pFormat, ##__VA_ARGS__)
+#define LogTrivial(_pFormat, ...)  Logger::Instance().Log(TLP::LoggerType::LOG_TRIVIAL, _pFormat, ##__VA_ARGS__)
 
 
     //

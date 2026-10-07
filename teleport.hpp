@@ -1,4 +1,4 @@
-﻿/**
+/**
 *    File:         teleport.hpp
 *
 *    Desc:
@@ -85,7 +85,7 @@ namespace TLP
     class CChannel:public CChannelBase
     {
     public:
-        volatile CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T_STRING strGUID, T_BOOL bGlobal);
+        CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T_STRING strGUID, T_BOOL bGlobal);
 
         virtual ~CChannel();
 
@@ -129,6 +129,7 @@ namespace TLP
     private:
         T_BOOL                  m_bGlobal;
         T_BOOL                  m_bActivated;
+        volatile T_BOOL         m_bWriting;
         T_ID                    m_nChannelId;
         T_ID                    m_nProcId;
         T_ID                    m_nMsgId;
@@ -175,7 +176,7 @@ namespace TLP
         RC          CreateNamedObject();
 
     private:
-        volatile CChannelMgr();
+        CChannelMgr();
         virtual ~CChannelMgr();
         
 

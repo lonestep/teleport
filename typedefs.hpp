@@ -78,8 +78,13 @@ namespace TLP
         free(_p);                    \
         _p = T_NULL;                 \
     }}
+#ifdef _MSC_VER
 #define TTRY  __try
 #define TEXCEPT_EXECUTE_HANDLER __except(EXCEPTION_EXECUTE_HANDLER)
+#else
+#define TTRY  try
+#define TEXCEPT_EXECUTE_HANDLER catch(...)
+#endif
 #define T_SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES
 #define T_CRITICAL_SECTION CRITICAL_SECTION
 
@@ -172,6 +177,7 @@ namespace TLP
     constexpr T_UINT32 DEFAULT_SHM_SIZE = 256u * 1024u;
     constexpr T_UINT32 MAX_SHM_SIZE = 256 * 1024 * 1024;
     constexpr T_USHORT PUB_ACK_TIMEOUT = 500;//ms
+    constexpr T_USHORT PUB_MSG_INTERVAL = 10;//ms
     constexpr T_PCSTR  NAMED_OBJ_PREFIX = "Teleport#";
     constexpr T_USHORT MAX_SUBSCRIBERS_PER_CHANNEL = 2048;
     constexpr T_UINT64 MAX_ID = UINT64_MAX;
@@ -182,7 +188,7 @@ namespace TLP
 #define MAX_BUFFER_LEN      256
 #define DEFAULT_SHM_SIZE    (256 * 1024)
 #define MAX_SHM_SIZE        (256 * 1024 * 1024)
-#define PUB_ACK_TIMEOUT     50  //ms
+#define PUB_ACK_TIMEOUT     500 //ms
 #define PUB_MSG_INTERVAL    10   //ms
 #define NAMED_OBJ_PREFIX    "Teleport#"
 #define MAX_SUBSCRIBERS_PER_CHANNEL 2048
@@ -302,10 +308,12 @@ namespace TLP
     //
     typedef union _SessionId
     {
-
         T_UINT64 Val;
-        T_ID     ProcId;
-        T_ID     ThreadId;
+        struct
+        {
+            T_ID     ProcId;
+            T_ID     ThreadId;
+        };
     }TSessionId, * TPSessionId;
 
 

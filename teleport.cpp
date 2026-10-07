@@ -1,4 +1,4 @@
-﻿/**
+/**
 *    File:         teleport.cpp
 *
 *    Desc:
@@ -274,6 +274,7 @@ T_STRING CChannelMgr::MakeObjectName()
 //
 CChannel* CChannelMgr::CreateChannel(T_PCSTR strChannelName, T_BOOL bGlobal)
 {
+    ScopedLock<NamedMutex> Lock(*m_pChannelShmMutex);
     T_ID nChannelId         = MakeChannelId(strChannelName, bGlobal);
     TPChannelRecord pRecord = FindChannelRecordById(nChannelId);
     T_STRING strGUID        = pRecord ? pRecord->Guid : "";
@@ -282,18 +283,20 @@ CChannel* CChannelMgr::CreateChannel(T_PCSTR strChannelName, T_BOOL bGlobal)
     {
         m_mId2Channels.emplace(nChannelId, pChannel);
         m_mName2Channels.emplace(strChannelName, pChannel);
-        TPChannelRecord pRecord = FindChannelRecordById(nChannelId);
         if (!pRecord)
         {
             pRecord = FindAvailableChannelRecord();
             if (pRecord)
             {
-                ScopedLock<NamedMutex> Lock(*m_pChannelShmMutex);
                 pRecord->ChannelId = nChannelId;
                 memcpy(pRecord->Guid, pChannel->GetChannelGuid().c_str(), MAX_GUID);
                 pRecord->RefCnt++;
                 pRecord->IsGlobal = bGlobal;
             }
+        }
+        else
+        {
+            pRecord->RefCnt++;
         }
         return pChannel;
     }
@@ -432,6 +435,7 @@ CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T
     m_nChannelId(nChannelId),
     m_nMsgId(0),
     m_bActivated(T_TRUE),
+    m_bWriting(T_FALSE),
     m_strNamedObjName(""),
     m_strGUID(strGUID),
     m_pAckRecord(T_NULL),
@@ -504,6 +508,18 @@ RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
     {
         return RC::CLOSED;
     }
+    T_UINT32 nThrottleYield = 0;
+    while (m_qPubQueue.Size() >= 2000 && !m_bStopped)
+    {
+        if (++nThrottleYield % 50 == 0)
+        {
+            TSleep(1);
+        }
+        else
+        {
+            TSleep(0);
+        }
+    }
     TPubMessage msg = {0};
     msg.pData = malloc(nSizeInByte);
     if(msg.pData)
@@ -521,14 +537,14 @@ RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
 //
 RC CChannel::Subscribe(OpenFlag Flag, T_BOOL bGlobal)
 {
-    
+    m_pChannelData->LockHdr();
     TPAckRecord pRecord = m_pChannelData->GetFirstAvailRecord();
     if (!pRecord)
     {
+        m_pChannelData->UnlockHdr();
         return RC::EXCEED_LIMIT;
     }
     LogInfo("Channel#%d proc %d was subscribed.", m_nChannelId, m_nProcId);
-    m_pChannelData->LockHdr();
     pRecord->ProcId           = m_nProcId;
     pRecord->AckFlag       = ACK_FLAG::INIT;
     RC rc = AddSession(Flag, pRecord);
@@ -547,7 +563,9 @@ RC CChannel::Unsubscribe(T_ID nProcId)
     {
         return RC::SUCCESS;
     }
+    m_pChannelData->LockHdr();
     m_pAckRecord->ProcId = 0;
+    m_pChannelData->UnlockHdr();
     m_pChannelData->IncDecSubscriber(T_FALSE);
     
     LogInfo("Channel#%d proc %d was unsubscribed.", m_nChannelId, m_nProcId);
@@ -609,6 +627,7 @@ T_BOOL CChannel::IsOpenned()
 TSessionId CChannel::GetSessionId()
 {
     TSessionId Sid;
+    Sid.Val      = 0;
     Sid.ProcId   = m_nProcId;
     Sid.ThreadId = TGetThreadId();
     return Sid;
@@ -619,10 +638,10 @@ TSessionId CChannel::GetSessionId()
 RC CChannel::WaitAllEventDone()
 {
     m_bActivated = T_FALSE;
-    while (m_qPubQueue.Size() > 0 || m_qCallbackQueue.Size() > 0)
+    while (m_qPubQueue.Size() > 0 || m_qCallbackQueue.Size() > 0 || m_bWriting)
     {
         //LogInfo("Waiting messages to be sent before close.");
-        TSleep(1000);
+        TSleep(10);
     }
     return RC::SUCCESS;
 }
@@ -676,7 +695,7 @@ RC CChannel::PutCallbackMsg(MsgType msgType,
     msg.pData          = pData;
     msg.nLength        = nLength;
     m_qCallbackQueue.Push(msg);
-    m_pEventCallback->Post(T_TRUE);
+    m_pEventCallback->Post(T_FALSE);
     return RC::SUCCESS;
 }
 
@@ -769,18 +788,24 @@ RC CChannel::RunPubThread()
     LogInfo("Channel %s(#%d) RunPubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
     // PUB_MSG_INTERVAL will affect the response efficiency on stop event
     // Also, affect the speed publishing messages & CPU usage
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, PUB_MSG_INTERVAL) && !m_bStopped)
+    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
-        if (m_qPubQueue.Size() > 0)
+        if (m_qPubQueue.Pop(msg))
         {
             RC rc = m_pChannelData->Lock();
-            if (m_qPubQueue.Pop(msg))
-            {
-                WriteMsg(msg);
-            }
+            m_bWriting = T_TRUE;
+            WriteMsg(msg);
+            m_bWriting = T_FALSE;
             rc = m_pChannelData->Unlock();
             CHK_RC(rc);
             SAFE_FREE_POINTER(msg.pData);
+        }
+        else
+        {
+            if (WAIT_OBJECT_0 == WaitForSingleObject(m_hStopEvent, PUB_MSG_INTERVAL))
+            {
+                break;
+            }
         }
     }
     LogInfo("Channel %s(#%d) RunPubThread() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -805,6 +830,7 @@ RC CChannel::RunSubThread()
             if( (m_pAckRecord->AckFlag != ACK_FLAG::INIT)||
                 (nLastMsgId == pHeader->nOriginalMsgId && nLastProcId == pHeader->nOriginalProcId) )
             {
+                TSleep(0);
                 continue;
             }
             nLastMsgId  = pHeader->nOriginalMsgId;
@@ -833,6 +859,13 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
             nProcId,
             rc);
 
+        m_pAckRecord->AckFlag = ACK_FLAG::DONE;
+        T_BOOL bReadDone = m_pChannelData->SetRead();
+        if (bReadDone)
+        {
+            m_pEventSubRead->Reset();
+            m_pEventReadDone->Post(T_FALSE);
+        }
         return rc;
     }
     rc = PutCallbackMsg(MsgType::MSG_SUB_GET,
@@ -844,9 +877,9 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
 
     m_pAckRecord->AckFlag = ACK_FLAG::DONE;
     T_BOOL bReadDone = m_pChannelData->SetRead();
-    m_pEventSubRead->Reset();
     if (bReadDone)
     {
+        m_pEventSubRead->Reset();
         m_pEventReadDone->Post(T_FALSE);
     }
     return rc;
@@ -865,22 +898,28 @@ RC CChannel::WriteMsg(TPubMessage& msg)
     }
     rc = PutCallbackMsg(MsgType::MSG_PUB_PUT, msg.nOriginalMsgId, m_nProcId);
     rc = m_pChannelData->SetUnread(msg.nOriginalMsgId, m_nProcId);
-    rc = m_pEventSubRead->Post(T_FALSE);
-    rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
-
-    if (IS_FAILED(rc))
+    if (m_pChannelData->GetShmHeader()->nUnreadCnt > 0)
     {
-        LogWarn("Read done failed: Proc#%d Message:%lld, try again...", m_nProcId, msg.nOriginalMsgId);
-        m_pChannelData->DumpUnread();
-        rc = m_pEventSubRead->Post(T_TRUE);
+        m_pEventReadDone->Reset();
+        m_pEventSubRead->Reset();
+        rc = m_pEventSubRead->Post(T_FALSE);
         rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
+
         if (IS_FAILED(rc))
         {
-            LogWarn("Read done failed again: Proc#%d Message:%lld, give up.", m_nProcId, msg.nOriginalMsgId);
-            rc = OnPubAckFailed(msg.nOriginalMsgId);
+            LogWarn("Read done failed: Proc#%d Message:%lld, try again...", m_nProcId, msg.nOriginalMsgId);
+            m_pChannelData->DumpUnread();
+            rc = m_pEventSubRead->Post(T_FALSE);
+            rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
+            if (IS_FAILED(rc))
+            {
+                LogWarn("Read done failed again: Proc#%d Message:%lld, give up.", m_nProcId, msg.nOriginalMsgId);
+                rc = OnPubAckFailed(msg.nOriginalMsgId);
+            }
         }
+        m_pEventSubRead->Reset();
+        m_pEventReadDone->Reset();
     }
-    m_pEventReadDone->Reset();
     return rc;
 }
 
@@ -894,6 +933,7 @@ RC CChannel::RunCallback()
     {
         RC rc = m_pEventCallback->Wait(1000);
         {
+            m_pEventCallback->Reset();
             while (m_pCallback && m_qCallbackQueue.Pop(msg))
             {
                 m_pCallback(&msg);
@@ -902,6 +942,14 @@ RC CChannel::RunCallback()
                     SAFE_FREE_POINTER(msg.pData);
                 }
             }
+        }
+    }
+    while (m_pCallback && m_qCallbackQueue.Pop(msg))
+    {
+        m_pCallback(&msg);
+        if(msg.eType == MsgType::MSG_SUB_GET)
+        {
+            SAFE_FREE_POINTER(msg.pData);
         }
     }
     LogInfo("Channel %s(#%d) RunCallback() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -1092,22 +1140,21 @@ T_BOOL CChannelData::SetRead()
 //
 RC CChannelData::SetUnread(T_MSG_ID nMsgId, T_ID nProcId)
 {
+    ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
     m_pChannelHeader->nOriginalProcId = nProcId;
     m_pChannelHeader->nOriginalMsgId  = nMsgId;
-    TPAckRecord pRecord = m_pChannelHeader->AckRecords;
-    for (T_USHORT i = 0; i < m_pChannelHeader->nSubscribers; i++)
+    T_SHORT nActiveSubscribers        = 0;
+    TPAckRecord pRecord               = m_pChannelHeader->AckRecords;
+    for (T_UINT32 i = 0; i < MAX_SUBSCRIBERS_PER_CHANNEL; i++)
     {
-        if (pRecord->ProcId)
+        if (pRecord->ProcId != 0)
         {
             pRecord->AckFlag = ACK_FLAG::INIT;
-        }
-        else
-        {
-            i--;
+            nActiveSubscribers++;
         }
         pRecord++;
     }
-    m_pChannelHeader->nUnreadCnt = m_pChannelHeader->nSubscribers;
+    m_pChannelHeader->nUnreadCnt = nActiveSubscribers;
     return RC::SUCCESS;
 }
 
@@ -1115,20 +1162,17 @@ RC CChannelData::SetUnread(T_MSG_ID nMsgId, T_ID nProcId)
 //
 RC CChannelData::DumpUnread()
 {
+    ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
     LogWarn("Unread process count:%d", m_pChannelHeader->nUnreadCnt);
     TPAckRecord pRecord = m_pChannelHeader->AckRecords;
-    for (T_USHORT i = 0; i < m_pChannelHeader->nSubscribers; i++)
+    for (T_UINT32 i = 0; i < MAX_SUBSCRIBERS_PER_CHANNEL; i++)
     {
-        if (pRecord->ProcId)
+        if (pRecord->ProcId != 0)
         {
             if(pRecord->AckFlag == ACK_FLAG::INIT)
             {
                 LogWarn("Proc:%d not read yet.", pRecord->ProcId);
             }
-        }
-        else
-        {
-            i--;
         }
         pRecord++;
     }

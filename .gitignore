@@ -32,3 +32,6 @@ CMakeSettings.json
 *.exe
 *.out
 *.app
+
+# Logs
+TlpLog/
