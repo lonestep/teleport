@@ -343,7 +343,9 @@ namespace TLP
         volatile T_ID       nOriginalProcId; // Original process ID (compatibility)
         volatile T_UINT32   nSlotCount;      // RING_SLOT_COUNT
         volatile T_UINT32   nSlotSize;       // sizeof(TRingSlot)
-        T_UINT8             HeaderPad[32];   // Pad to 64 bytes
+        volatile T_LONG     nWaitingSubs;    // Subscribers currently sleeping on event
+        volatile T_LONG     nWaitingPubs;    // Publishers currently sleeping on event
+        T_UINT8             HeaderPad[24];   // Pad to 64 bytes
 
         TPublisherHeader    PubHeader;       // 64 bytes cache line
 

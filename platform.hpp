@@ -127,10 +127,13 @@ namespace TLP
 
 #ifdef Windows
 #define T_CPU_PAUSE() YieldProcessor()
+#define T_THREAD_YIELD() SwitchToThread()
 #elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #define T_CPU_PAUSE() __builtin_ia32_pause()
+#define T_THREAD_YIELD() sched_yield()
 #else
 #define T_CPU_PAUSE() ((void)0)
+#define T_THREAD_YIELD() ((void)0)
 #endif
 
 

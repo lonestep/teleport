@@ -35,3 +35,4 @@ CMakeSettings.json
 
 # Logs
 TlpLog/
+benchmark_logs/

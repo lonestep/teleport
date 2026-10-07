@@ -544,8 +544,7 @@ RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
     m_bWriting = T_FALSE;
     if (IS_SUCCESS(rc))
     {
-        T_UINT64 minSeq = m_pChannelData->GetMinSubscriberSequence();
-        if ((nOutMsgId - minSeq <= 4) || ((nOutMsgId & 31) == 0))
+        if (m_pChannelData->GetShmHeader()->nWaitingSubs > 0)
         {
             m_pEventSubRead->Post(T_FALSE);
         }
@@ -576,8 +575,7 @@ RC CChannel::CommitBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte)
     RC rc = m_pChannelData->CommitRingBuffer(nToken, nSizeInByte, m_nProcId, nOutMsgId);
     if (IS_SUCCESS(rc))
     {
-        T_UINT64 minSeq = m_pChannelData->GetMinSubscriberSequence();
-        if ((nOutMsgId - minSeq <= 4) || ((nOutMsgId & 31) == 0))
+        if (m_pChannelData->GetShmHeader()->nWaitingSubs > 0)
         {
             m_pEventSubRead->Post(T_FALSE);
         }
@@ -849,13 +847,16 @@ RC CChannel::RunPubThread()
 {
     TPubMessage msg;
     LogInfo("Channel %s(#%d) RunPubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
+    while (!m_bStopped)
     {
         if (m_qPubQueue.Pop(msg))
         {
             T_MSG_ID nOutMsgId = 0;
             m_pChannelData->WriteRingMsg(msg.pData, msg.nLength, nOutMsgId, m_nProcId);
-            m_pEventSubRead->Post(T_FALSE);
+            if (m_pChannelData->GetShmHeader()->nWaitingSubs > 0)
+            {
+                m_pEventSubRead->Post(T_FALSE);
+            }
             SAFE_FREE_POINTER(msg.pData);
         }
         else
@@ -876,7 +877,7 @@ RC CChannel::RunPubThread()
 RC CChannel::RunSubThread()
 {
     LogInfo("Channel %s(#%d) RunSubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
+    while (!m_bStopped)
     {
         if (!m_pAckRecord)
         {
@@ -906,7 +907,7 @@ RC CChannel::RunSubThread()
             }
             m_pAckRecord->LastReadSeq = nMsgId;
             m_pAckRecord->AckFlag = ACK_FLAG::DONE;
-            if (m_pChannelData->GetShmHeader()->PubHeader.WriteCursor - nMsgId >= RING_SLOT_COUNT - 64)
+            if (m_pChannelData->GetShmHeader()->nWaitingPubs > 0)
             {
                 m_pEventReadDone->Post(T_FALSE);
             }
@@ -921,7 +922,22 @@ RC CChannel::RunSubThread()
         }
         else
         {
-            m_pEventSubRead->Wait(1);
+#ifdef Windows
+            InterlockedIncrement((LONG*)&m_pChannelData->GetShmHeader()->nWaitingSubs);
+#else
+            __sync_add_and_fetch(&m_pChannelData->GetShmHeader()->nWaitingSubs, 1);
+#endif
+            T_UINT64 targetSeq = m_pAckRecord->LastReadSeq + 1;
+            TPRingSlot pSlot = m_pChannelData->GetSlot((T_UINT32)(targetSeq & RING_SLOT_MASK));
+            if (pSlot->nSequence != targetSeq && !m_bStopped)
+            {
+                m_pEventSubRead->Wait(1);
+            }
+#ifdef Windows
+            InterlockedDecrement((LONG*)&m_pChannelData->GetShmHeader()->nWaitingSubs);
+#else
+            __sync_sub_and_fetch(&m_pChannelData->GetShmHeader()->nWaitingSubs, 1);
+#endif
         }
     }
     LogInfo("Channel %s(#%d) RunSubThread() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -958,7 +974,11 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
         }
         m_pAckRecord->LastReadSeq = nOutMsgId;
         m_pAckRecord->AckFlag = ACK_FLAG::DONE;
-        m_pEventReadDone->Post(T_FALSE);
+        if (m_pChannelData->GetShmHeader()->nWaitingPubs > 0)
+        {
+            m_pEventReadDone->Post(T_FALSE);
+        }
+        return RC::SUCCESS;
     }
     return rc;
 }
@@ -971,7 +991,10 @@ RC CChannel::WriteMsg(TPubMessage& msg)
     RC rc = m_pChannelData->WriteRingMsg(msg.pData, msg.nLength, nOutMsgId, m_nProcId);
     if (IS_SUCCESS(rc))
     {
-        m_pEventSubRead->Post(T_FALSE);
+        if (m_pChannelData->GetShmHeader()->nWaitingSubs > 0)
+        {
+            m_pEventSubRead->Post(T_FALSE);
+        }
     }
     return rc;
 }
@@ -982,7 +1005,7 @@ RC CChannel::RunCallback()
 {
     TCbMessage msg;
     LogInfo("Channel %s(#%d) RunCallback() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
+    while (!m_bStopped)
     {
         RC rc = m_pEventCallback->Wait(100);
         m_pEventCallback->Reset();
@@ -1045,6 +1068,8 @@ CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte) :
         m_pChannelHeader->nSlotSize       = sizeof(TRingSlot);
         m_pChannelHeader->PubHeader.WriteCursor  = 0;
         m_pChannelHeader->PubHeader.CommitCursor = 0;
+        m_pChannelHeader->nWaitingSubs           = 0;
+        m_pChannelHeader->nWaitingPubs           = 0;
         memset((void*)m_pChannelHeader->AckRecords, 0, sizeof(m_pChannelHeader->AckRecords));
     }
     UnlockHdr();
@@ -1327,9 +1352,13 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
             cachedMinSeq = GetMinSubscriberSequence();
             if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
             {
-                if (++nSpin < 200)
+                if (++nSpin < 500)
                 {
                     T_CPU_PAUSE();
+                }
+                else if (nSpin < 550)
+                {
+                    T_THREAD_YIELD();
                 }
                 else
                 {
@@ -1428,9 +1457,13 @@ RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UIN
             cachedMinSeq = GetMinSubscriberSequence();
             if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
             {
-                if (++nSpin < 200)
+                if (++nSpin < 500)
                 {
                     T_CPU_PAUSE();
+                }
+                else if (nSpin < 550)
+                {
+                    T_THREAD_YIELD();
                 }
                 else
                 {
@@ -1535,12 +1568,23 @@ RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32
 
     if (pSlot->nSequence < targetSeq)
     {
-        for (T_UINT32 i = 0; i < 200; i++)
+        for (T_UINT32 i = 0; i < 1000; i++)
         {
             T_CPU_PAUSE();
             if (pSlot->nSequence >= targetSeq)
             {
                 break;
+            }
+        }
+        if (pSlot->nSequence < targetSeq)
+        {
+            for (T_UINT32 j = 0; j < 30; j++)
+            {
+                T_THREAD_YIELD();
+                if (pSlot->nSequence >= targetSeq)
+                {
+                    break;
+                }
             }
         }
     }
