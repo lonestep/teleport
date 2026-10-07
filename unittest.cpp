@@ -74,7 +74,7 @@ RC OnMessage(PTCbMessage pMessage)
 //
 T_VOID Usage()
 {
-    printf("teleport [ut|stress <msg_count>|mp_listen <total_msgs>|mp_send <msg_count> <sender_id>|at <testconf index>|listen <testconf index>|send <testconf index>]\n");
+    printf("teleport [ut|stress <msg_count>|mp_listen <total_msgs> [listener_id]|mp_send <msg_count> <sender_id> [min_subs]|at <testconf index>|listen <testconf index>|send <testconf index>]\n");
     exit(-1);
 }
 
@@ -140,7 +140,7 @@ T_VOID SendMessageToTopic(T_PCSTR  pTopic, T_UINT32 nMsg, T_BOOL bGlobal = T_FAL
     while (nLoop--)
     {
         strMsg = "Message_";
-        strMsg += std::to_string(GetCurrentProcessId());
+        strMsg += std::to_string(TGetProcId());
         strMsg += "_";
         strMsg += std::to_string(nMsg - nLoop);
         rc = ITeleport::Send(nChannelId, (T_PVOID)strMsg.c_str(), (T_UINT32)strMsg.length());
@@ -179,7 +179,7 @@ T_VOID SendMessageToTopicAndListen(T_PCSTR  pTopic,
     while (nLoop--)
     {
         strMsg = "Message_";
-        strMsg += std::to_string(GetCurrentProcessId());
+        strMsg += std::to_string(TGetProcId());
         strMsg += "_";
         strMsg += std::to_string(nMsg - nLoop);
         rc = ITeleport::Send(g_MixChannelId, (T_PVOID)strMsg.c_str(), (T_UINT32)strMsg.length());
@@ -425,6 +425,203 @@ T_VOID UT_TestMessageDeliveryNoLoss()
 
 
 //
+static volatile T_UINT32 g_nZeroCopyRecvCount = 0;
+static std::string g_strZeroCopyLastMsg = "";
+
+static RC ZeroCopyTestCallback(PTCbMessage pMessage)
+{
+    if (!pMessage)
+    {
+        return RC::INVALID_PARAM;
+    }
+    if (pMessage->eType == MsgType::MSG_SUB_GET)
+    {
+        g_nZeroCopyRecvCount++;
+        if (pMessage->pData && pMessage->nLength > 0)
+        {
+            g_strZeroCopyLastMsg = std::string((const char*)pMessage->pData, pMessage->nLength);
+        }
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_TestZeroCopy()
+{
+    g_nZeroCopyRecvCount = 0;
+    g_strZeroCopyLastMsg = "";
+
+    T_PCSTR pTopic = "ut_zerocopy_topic";
+    T_ID nSubChannelId = 0;
+    RC rc = ITeleport::Open(pTopic,
+        CH_LISTEN | CH_CREATE_IF_NOEXIST,
+        nSubChannelId,
+        ZeroCopyTestCallback,
+        T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    T_ID nPubChannelId = 0;
+    rc = ITeleport::Open(pTopic,
+        CH_SEND | CH_CREATE_IF_NOEXIST,
+        nPubChannelId,
+        ZeroCopyTestCallback,
+        T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    T_PVOID pBuffer = T_NULL;
+    T_UINT64 nToken = 0;
+    std::string testData = "In-Place Zero-Copy Message Content!";
+
+    rc = ITeleport::AcquireBuffer(nPubChannelId, (T_UINT32)testData.length(), pBuffer, nToken);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    SHOULD_BE_TRUE((pBuffer != T_NULL));
+
+    memcpy(pBuffer, testData.c_str(), testData.length());
+
+    rc = ITeleport::CommitBuffer(nPubChannelId, nToken, (T_UINT32)testData.length());
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    T_UINT32 nWait = 50;
+    while (g_nZeroCopyRecvCount < 1 && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubChannelId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubChannelId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nZeroCopyRecvCount, 1);
+    SHOULD_BE_TRUE((g_strZeroCopyLastMsg == testData));
+}
+
+
+//
+T_VOID UT_TestZombieCleanup()
+{
+    CChannelData channelData("test_zombie_cleanup", DEFAULT_SHM_SIZE);
+    TPChannelShmHeader pHeader = channelData.GetShmHeader();
+    SHOULD_BE_TRUE((pHeader != T_NULL));
+
+    channelData.LockHdr();
+    memset((T_PVOID)pHeader->AckRecords, 0, sizeof(TAckRecord) * MAX_SUBSCRIBERS_PER_CHANNEL);
+    pHeader->AckRecords[0].ProcId = 99999999;
+    pHeader->AckRecords[0].AckFlag = ACK_FLAG::INIT;
+    pHeader->AckRecords[0].LastReadSeq = 0;
+    pHeader->AckRecords[1].ProcId = TGetProcId();
+    pHeader->AckRecords[1].AckFlag = ACK_FLAG::INIT;
+    pHeader->AckRecords[1].LastReadSeq = 10;
+    pHeader->nSubscribers = 2;
+    channelData.UnlockHdr();
+
+    channelData.CleanZombieSubscribers();
+
+    channelData.LockHdr();
+    SHOULD_BE_EQUAL(pHeader->AckRecords[0].ProcId, 0);
+    SHOULD_BE_EQUAL(pHeader->AckRecords[1].ProcId, TGetProcId());
+    SHOULD_BE_EQUAL(pHeader->nSubscribers, 1);
+    channelData.UnlockHdr();
+
+    T_UINT64 minSeq = channelData.GetMinSubscriberSequence();
+    SHOULD_BE_EQUAL(minSeq, 10);
+}
+
+
+//
+T_VOID UT_TestCRCIntegrity()
+{
+    const char* pMsg = "Hello Teleport Integrity Check!";
+    T_UINT32 nLen = (T_UINT32)strlen(pMsg);
+    T_UINT32 crc1 = TComputeCRC32(pMsg, nLen);
+    T_UINT32 crc2 = TComputeCRC32(pMsg, nLen);
+    SHOULD_BE_EQUAL(crc1, crc2);
+    SHOULD_BE_TRUE((crc1 != 0));
+
+    const char* pCorrupted = "Hello Teleport Integrity Xheck!";
+    T_UINT32 crcCorrupt = TComputeCRC32(pCorrupted, nLen);
+    SHOULD_BE_TRUE((crc1 != crcCorrupt));
+}
+
+
+//
+static volatile T_UINT32 g_nCorruptRecvCount = 0;
+static std::vector<T_MSG_ID> g_vCorruptRecvIds;
+
+static RC CorruptTestCallback(PTCbMessage pMessage)
+{
+    if (pMessage && pMessage->eType == MsgType::MSG_SUB_GET)
+    {
+        g_nCorruptRecvCount++;
+        g_vCorruptRecvIds.push_back(pMessage->nOriginalMsgId);
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_TestCorruptedMessageDiscard()
+{
+    g_nCorruptRecvCount = 0;
+    g_vCorruptRecvIds.clear();
+
+    T_PCSTR pTopic = "ut_corrupt_topic";
+    T_ID nSubChannelId = 0;
+    RC rc = ITeleport::Open(pTopic,
+        CH_LISTEN | CH_CREATE_IF_NOEXIST,
+        nSubChannelId,
+        CorruptTestCallback,
+        T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    T_ID nPubChannelId = 0;
+    rc = ITeleport::Open(pTopic,
+        CH_SEND | CH_CREATE_IF_NOEXIST,
+        nPubChannelId,
+        CorruptTestCallback,
+        T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    std::string msg1 = "Valid Message 1";
+    rc = ITeleport::Send(nPubChannelId, (T_PCVOID)msg1.c_str(), (T_UINT32)msg1.length());
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    CChannel* pCh = CChannelMgr::Instance().GetChannelById(nSubChannelId);
+    SHOULD_BE_TRUE((pCh != T_NULL));
+    T_PVOID pBuf = T_NULL;
+    T_UINT64 token = 0;
+    std::string msg2 = "Corrupted Message 2";
+    rc = ITeleport::AcquireBuffer(nPubChannelId, (T_UINT32)msg2.length(), pBuf, token);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    memcpy(pBuf, msg2.c_str(), msg2.length());
+    rc = ITeleport::CommitBuffer(nPubChannelId, token, (T_UINT32)msg2.length());
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    TPRingSlot pSlot2 = pCh->GetChannelData()->GetSlot((T_UINT32)(token & RING_SLOT_MASK));
+    pSlot2->nChecksum ^= 0x12345678;
+
+    std::string msg3 = "Valid Message 3";
+    rc = ITeleport::Send(nPubChannelId, (T_PCVOID)msg3.c_str(), (T_UINT32)msg3.length());
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    T_UINT32 nWait = 50;
+    while (g_nCorruptRecvCount < 2 && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubChannelId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubChannelId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nCorruptRecvCount, 2);
+    if (g_vCorruptRecvIds.size() >= 2)
+    {
+        SHOULD_BE_EQUAL(g_vCorruptRecvIds[0], 1);
+        SHOULD_BE_EQUAL(g_vCorruptRecvIds[1], 3);
+    }
+}
+
+
+//
 static volatile T_UINT32 g_nStressRecvCount = 0;
 static volatile T_UINT32 g_nStressOrderErrorCount = 0;
 
@@ -606,7 +803,7 @@ static RC MPListenCallback(PTCbMessage pMessage)
 }
 
 //
-T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
+T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg, T_UINT32 nListenerId = 0)
 {
     g_nMPTotalRecv = 0;
     g_nMPOrderErrors = 0;
@@ -620,13 +817,13 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
         T_FALSE);
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
-    printf("MP Listener ready on topic '%s', expecting %u messages...\n", pTopic, nTotalMsg);
+    printf("MP Listener %u ready on topic '%s', expecting %u messages...\n", nListenerId, pTopic, nTotalMsg);
     fflush(stdout);
 
     T_UINT64 tStartTime = GetTimeMs();
     T_BOOL bStarted = T_FALSE;
     T_UINT32 nLastReport = 0;
-    T_UINT32 nWaitLoops = 20000; // up to 1000s
+    T_UINT32 nWaitLoops = 40000; // up to 2000s
 
     while (g_nMPTotalRecv < nTotalMsg && nWaitLoops--)
     {
@@ -640,8 +837,8 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
         {
             T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
-            printf("MP Listener: Received %u / %u | Elapsed: %llu ms (%.0f msg/s)\n",
-                g_nMPTotalRecv, nTotalMsg, (unsigned long long)nElapsed, (double)g_nMPTotalRecv * 1000.0 / nElapsed);
+            printf("MP Listener %u: Received %u / %u | Elapsed: %llu ms (%.0f msg/s)\n",
+                nListenerId, g_nMPTotalRecv, nTotalMsg, (unsigned long long)nElapsed, (double)g_nMPTotalRecv * 1000.0 / nElapsed);
             fflush(stdout);
             nLastReport = g_nMPTotalRecv;
         }
@@ -654,7 +851,7 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
     if (nTotalElapsed == 0) nTotalElapsed = 1;
     T_UINT32 nLostCount = nTotalMsg - g_nMPTotalRecv;
 
-    printf("\n================ Multi-Process Stress Result ================\n");
+    printf("\n================ Multi-Process Stress Result (Listener %u) ================\n", nListenerId);
     printf("Total Messages Expected: %u\n", nTotalMsg);
     printf("Total Messages Received: %u\n", g_nMPTotalRecv);
     printf("Total Messages Lost:     %u\n", nLostCount);
@@ -666,7 +863,8 @@ T_VOID RunMPListen(T_PCSTR pTopic, T_UINT32 nTotalMsg)
     }
     printf("Elapsed Time:            %llu ms (%.2f s)\n", (unsigned long long)nTotalElapsed, (double)nTotalElapsed / 1000.0);
     printf("Throughput:              %.0f msg/s\n", (double)g_nMPTotalRecv * 1000.0 / nTotalElapsed);
-    printf("=============================================================\n\n");
+    printf("========================================================================\n\n");
+    fflush(stdout);
 }
 
 //
@@ -676,7 +874,7 @@ static RC MPSendCallback(PTCbMessage pMessage)
 }
 
 //
-T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
+T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId, T_UINT32 nExpectedSubs = 1)
 {
     T_ID nChannelId = 0;
     RC rc = ITeleport::Open(pTopic,
@@ -687,9 +885,9 @@ T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
     CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
-    while (pChannel && (T_USHORT)pChannel->GetSubscriberCount() < 1)
+    while (pChannel && (T_USHORT)pChannel->GetSubscriberCount() < nExpectedSubs)
     {
-        TSleep(50);
+        TSleep(20);
     }
 
     printf("MP Sender %u started: sending %u messages...\n", nSenderId, nMsgCount);
@@ -711,7 +909,7 @@ T_VOID RunMPSend(T_PCSTR pTopic, T_UINT32 nMsgCount, T_UINT32 nSenderId)
             break;
         }
 
-        if (i - nLastReport >= 100000 || i == nMsgCount)
+        if (i - nLastReport >= 50000 || i == nMsgCount)
         {
             T_UINT64 nElapsed = GetTimeMs() - tStartTime;
             if (nElapsed == 0) nElapsed = 1;
@@ -774,6 +972,24 @@ int main(int argc, char** argv)
         return -1;
     }
     T_PCSTR pCmd = argv[1];
+    if (0 == _stricmp(pCmd, "mp_listen"))
+    {
+        if (argc < 3) { Usage(); return -1; }
+        T_UINT32 nTotalMsg = (T_UINT32)atoi(argv[2]);
+        T_UINT32 nListenerId = (argc >= 4) ? (T_UINT32)atoi(argv[3]) : 0;
+        RunMPListen("ut_mp_stress_topic", nTotalMsg, nListenerId);
+        return 0;
+    }
+    else if (0 == _stricmp(pCmd, "mp_send"))
+    {
+        if (argc < 4) { Usage(); return -1; }
+        T_UINT32 nMsgCount = (T_UINT32)atoi(argv[2]);
+        T_UINT32 nSenderId = (T_UINT32)atoi(argv[3]);
+        T_UINT32 nExpectedSubs = (argc >= 5) ? (T_UINT32)atoi(argv[4]) : 1;
+        RunMPSend("ut_mp_stress_topic", nMsgCount, nSenderId, nExpectedSubs);
+        return 0;
+    }
+
     if (argc == 2)
     {
         if (0 == _stricmp(pCmd, "ut"))
@@ -784,6 +1000,10 @@ int main(int argc, char** argv)
             UT_TestGetFirstAvailRecord();
             UT_TestChannelGuidConsistency();
             UT_TestMessageDeliveryNoLoss();
+            UT_TestZeroCopy();
+            UT_TestZombieCleanup();
+            UT_TestCRCIntegrity();
+            UT_TestCorruptedMessageDiscard();
             return 0;
         }
         else if (0 == _stricmp(pCmd, "stress"))
@@ -799,12 +1019,6 @@ int main(int argc, char** argv)
             T_UINT32 nTotal = (T_UINT32)atoi(argv[2]);
             if (nTotal == 0) nTotal = 2000000;
             UT_TestStress(nTotal);
-            return 0;
-        }
-        else if (0 == _stricmp(pCmd, "mp_listen"))
-        {
-            T_UINT32 nTotalMsg = (T_UINT32)atoi(argv[2]);
-            RunMPListen("ut_mp_stress_topic", nTotalMsg);
             return 0;
         }
         T_UINT32 nConfIndex = atoi(argv[2]);
@@ -848,16 +1062,6 @@ int main(int argc, char** argv)
             T_UINT32 nTotalMsg = nSendAndListen * nMsgSend;
             std::string strTopic = pTopic + std::string("_sl");
             SendMessageToTopicAndListen(strTopic.c_str(), nMsgSend, nTotalMsg, bGlobal);
-            return 0;
-        }
-    }
-    else if (argc == 4)
-    {
-        if (0 == _stricmp(pCmd, "mp_send"))
-        {
-            T_UINT32 nMsgCount = (T_UINT32)atoi(argv[2]);
-            T_UINT32 nSenderId = (T_UINT32)atoi(argv[3]);
-            RunMPSend("ut_mp_stress_topic", nMsgCount, nSenderId);
             return 0;
         }
     }

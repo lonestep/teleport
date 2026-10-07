@@ -13,6 +13,8 @@
 #else
 #include <sys/types.h>
 #include <pthread.h>
+#include <string.h>
+#include <strings.h>
 #endif
 
 
@@ -28,6 +30,7 @@ namespace TLP
     typedef T_CHAR*         T_PCHAR;
     typedef T_CCHAR*        T_PCCHAR;
     typedef UCHAR           T_UCHAR;
+    typedef UINT8           T_UINT8;
     typedef T_UCHAR*        T_PUCHAR;
     typedef CONST T_UCHAR   T_CUCHAR;
     typedef T_CUCHAR*       T_PCUCHAR;
@@ -45,7 +48,7 @@ namespace TLP
     typedef PDWORD          T_PULONG;
     typedef USHORT          T_USHORT;
     typedef VOID            T_VOID;
-    typedef CONST PVOID     T_PCVOID;
+    typedef LPCVOID         T_PCVOID;
     typedef PVOID           T_PVOID;
     typedef CHAR            T_CHAR;
     typedef std::string     T_STRING;
@@ -107,6 +110,7 @@ namespace TLP
     typedef T_CCHAR*          T_PCCHAR;
 
     typedef T_UCHAR*          T_PUCHAR;
+    typedef uint8_t           T_UINT8;
     typedef const T_UCHAR     T_CUCHAR;
     typedef T_CUCHAR*         T_PCUCHAR;
     typedef T_UCHAR           T_BOOL;
@@ -162,8 +166,12 @@ namespace TLP
 #define PAGE_READONLY            0x2
 #define PAGE_READWRITE           0x4
 #define T_SECURITY_ATTRIBUTES    pthread_mutexattr_t
+#define SECURITY_ATTRIBUTES      T_SECURITY_ATTRIBUTES
 #define INFINITE                 999999
 #define T_CRITICAL_SECTION       pthread_mutex_t
+#define CRITICAL_SECTION         T_CRITICAL_SECTION
+#define _stricmp                 strcasecmp
+#define memcpy_s(dst, dstsize, src, count) memcpy(dst, src, count)
 
 #endif // #if Windows
 
@@ -174,25 +182,35 @@ namespace TLP
     constexpr T_USHORT MAX_GUID = 64;
     constexpr T_USHORT MAX_NAME = 128;
     constexpr T_USHORT MAX_BUFFER_LEN = 256;
-    constexpr T_UINT32 DEFAULT_SHM_SIZE = 256u * 1024u;
+    constexpr T_UINT32 DEFAULT_SHM_SIZE = 18u * 1024u * 1024u; // 18MB
     constexpr T_UINT32 MAX_SHM_SIZE = 256 * 1024 * 1024;
     constexpr T_USHORT PUB_ACK_TIMEOUT = 500;//ms
     constexpr T_USHORT PUB_MSG_INTERVAL = 10;//ms
     constexpr T_PCSTR  NAMED_OBJ_PREFIX = "Teleport#";
     constexpr T_USHORT MAX_SUBSCRIBERS_PER_CHANNEL = 2048;
     constexpr T_UINT64 MAX_ID = UINT64_MAX;
+    constexpr T_UINT32 TELEPORT_MAGIC = 0x54454C50; // 'TELP'
+    constexpr T_UINT32 TELEPORT_VERSION = 2;
+    constexpr T_UINT32 RING_SLOT_COUNT = 4096;
+    constexpr T_UINT32 RING_SLOT_MASK = RING_SLOT_COUNT - 1;
+    constexpr T_UINT32 MAX_SLOT_DATA_SIZE = 4096;
 #else
 
 #define MAX_GUID            64
 #define MAX_NAME            128
 #define MAX_BUFFER_LEN      256
-#define DEFAULT_SHM_SIZE    (256 * 1024)
+#define DEFAULT_SHM_SIZE    (18 * 1024 * 1024)
 #define MAX_SHM_SIZE        (256 * 1024 * 1024)
 #define PUB_ACK_TIMEOUT     500 //ms
 #define PUB_MSG_INTERVAL    10   //ms
 #define NAMED_OBJ_PREFIX    "Teleport#"
 #define MAX_SUBSCRIBERS_PER_CHANNEL 2048
 #define MAX_ID              UINT64_MAX
+#define TELEPORT_MAGIC      0x54454C50
+#define TELEPORT_VERSION    2
+#define RING_SLOT_COUNT     4096
+#define RING_SLOT_MASK      (RING_SLOT_COUNT - 1)
+#define MAX_SLOT_DATA_SIZE  4096
 
 #endif //if (__cplusplus >= 201103L)
 
@@ -203,6 +221,7 @@ namespace TLP
 
     enum class ACK_FLAG
     {
+        NONE = 0,
         INIT = 0xdead,
         DONE = 0xface
     };
@@ -279,21 +298,56 @@ namespace TLP
 
 
     //
-    typedef struct _Ack_Record
+    typedef struct alignas(64) _Ring_Slot
     {
-        T_ID     ProcId;
-        volatile ACK_FLAG AckFlag;
+        volatile T_UINT32 nMagic;        // TELEPORT_MAGIC
+        volatile T_UINT32 nChecksum;     // CRC32 of payload
+        volatile T_UINT64 nSequence;     // Monotonic global sequence (1, 2, 3...)
+        volatile T_ID     nSenderProcId; // Process ID of sender
+        volatile T_UINT32 nLength;       // Payload length
+        volatile T_UINT32 nFlags;        // Slot flags
+        volatile T_UINT32 nReserved;     // Padding/alignment
+        T_UINT8           Data[MAX_SLOT_DATA_SIZE]; // In-place payload
+        T_UINT8           SlotPad[32];   // Align total slot to 4160 bytes (65 cache lines)
+    }TRingSlot, * TPRingSlot;
+
+
+    // 64-byte aligned subscriber record (1 cache line per subscriber)
+    typedef struct alignas(64) _Ack_Record
+    {
+        volatile T_ID        ProcId;
+        volatile ACK_FLAG    AckFlag;
+        volatile T_UINT64    LastReadSeq;
+        volatile T_UINT64    HeartbeatTick;
+        volatile T_UINT32    Status;
+        T_UINT8              Padding[36]; // Pad to 64 bytes
     }TAckRecord, * TPAckRecord;
 
 
-    //
-    typedef struct _ChannelShmHeader
+    typedef struct alignas(64) _Publisher_Header
     {
-        volatile T_SHORT    nUnreadCnt;
-        volatile T_SHORT    nSubscribers;
-        volatile T_MSG_ID   nOriginalMsgId;
-        volatile T_ID       nOriginalProcId;
-        TAckRecord AckRecords[MAX_SUBSCRIBERS_PER_CHANNEL];
+        volatile T_UINT64 WriteCursor;   // Next sequence to allocate
+        volatile T_UINT64 CommitCursor;  // Highest contiguous committed sequence
+        T_UINT8           Padding[48];   // Pad to 64 bytes
+    }TPublisherHeader, * TPPublisherHeader;
+
+
+    //
+    typedef struct alignas(64) _ChannelShmHeader
+    {
+        volatile T_UINT32   nMagic;          // TELEPORT_MAGIC
+        volatile T_UINT32   nVersion;        // TELEPORT_VERSION
+        volatile T_SHORT    nUnreadCnt;      // Active unread / pending count
+        volatile T_SHORT    nSubscribers;    // Active subscriber count
+        volatile T_MSG_ID   nOriginalMsgId;  // Original message ID (compatibility)
+        volatile T_ID       nOriginalProcId; // Original process ID (compatibility)
+        volatile T_UINT32   nSlotCount;      // RING_SLOT_COUNT
+        volatile T_UINT32   nSlotSize;       // sizeof(TRingSlot)
+        T_UINT8             HeaderPad[32];   // Pad to 64 bytes
+
+        TPublisherHeader    PubHeader;       // 64 bytes cache line
+
+        TAckRecord AckRecords[MAX_SUBSCRIBERS_PER_CHANNEL]; // 64 bytes each
     }TChannelShmHeader, * TPChannelShmHeader;
 
 

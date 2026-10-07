@@ -1,0 +1,39 @@
+wine: created the configuration directory '/root/.wine'
+error: XDG_RUNTIME_DIR is invalid or not set in the environment.
+error: XDG_RUNTIME_DIR is invalid or not set in the environment.
+RunMPListen         		unittest.cpp(818)	[PASS]
+MP Listener 1 ready on topic 'ut_mp_stress_topic', expecting 2000000 messages...
+MP Listener 1: Received 201964 / 2000000 | Elapsed: 2352 ms (85869 msg/s)
+MP Listener 1: Received 405970 / 2000000 | Elapsed: 4805 ms (84489 msg/s)
+MP Listener 1: Received 606199 / 2000000 | Elapsed: 7108 ms (85284 msg/s)
+MP Listener 1: Received 810025 / 2000000 | Elapsed: 9510 ms (85176 msg/s)
+MP Listener 1: Received 1014298 / 2000000 | Elapsed: 11963 ms (84786 msg/s)
+MP Listener 1: Received 1216243 / 2000000 | Elapsed: 14366 ms (84661 msg/s)
+MP Listener 1: Received 1417234 / 2000000 | Elapsed: 16768 ms (84520 msg/s)
+MP Listener 1: Received 1617945 / 2000000 | Elapsed: 19271 ms (83958 msg/s)
+MP Listener 1: Received 1819417 / 2000000 | Elapsed: 21574 ms (84334 msg/s)
+MP Listener 1: Received 2000000 / 2000000 | Elapsed: 23627 ms (84649 msg/s)
+RunMPListen         		unittest.cpp(848)	[PASS]
+
+================ Multi-Process Stress Result (Listener 1) ================
+Total Messages Expected: 2000000
+Total Messages Received: 2000000
+Total Messages Lost:     0
+Order Errors:            0
+Active Sender Processes: 12
+  - Sender ID 1: 166667 messages received
+  - Sender ID 2: 166667 messages received
+  - Sender ID 3: 166667 messages received
+  - Sender ID 4: 166667 messages received
+  - Sender ID 5: 166667 messages received
+  - Sender ID 6: 166667 messages received
+  - Sender ID 7: 166667 messages received
+  - Sender ID 8: 166667 messages received
+  - Sender ID 9: 166666 messages received
+  - Sender ID 10: 166666 messages received
+  - Sender ID 11: 166666 messages received
+  - Sender ID 12: 166666 messages received
+Elapsed Time:            23687 ms (23.69 s)
+Throughput:              84434 msg/s
+========================================================================
+

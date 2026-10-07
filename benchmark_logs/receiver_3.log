@@ -1,0 +1,37 @@
+wine: created the configuration directory '/root/.wine'
+RunMPListen         		unittest.cpp(818)	[PASS]
+MP Listener 3 ready on topic 'ut_mp_stress_topic', expecting 2000000 messages...
+MP Listener 3: Received 202449 / 2000000 | Elapsed: 2353 ms (86039 msg/s)
+MP Listener 3: Received 406697 / 2000000 | Elapsed: 4808 ms (84588 msg/s)
+MP Listener 3: Received 607494 / 2000000 | Elapsed: 7117 ms (85358 msg/s)
+MP Listener 3: Received 807654 / 2000000 | Elapsed: 9475 ms (85241 msg/s)
+MP Listener 3: Received 1007727 / 2000000 | Elapsed: 11880 ms (84826 msg/s)
+MP Listener 3: Received 1209947 / 2000000 | Elapsed: 14284 ms (84706 msg/s)
+MP Listener 3: Received 1411893 / 2000000 | Elapsed: 16691 ms (84590 msg/s)
+MP Listener 3: Received 1612129 / 2000000 | Elapsed: 19194 ms (83991 msg/s)
+MP Listener 3: Received 1813131 / 2000000 | Elapsed: 21500 ms (84332 msg/s)
+MP Listener 3: Received 2000000 / 2000000 | Elapsed: 23654 ms (84552 msg/s)
+RunMPListen         		unittest.cpp(848)	[PASS]
+
+================ Multi-Process Stress Result (Listener 3) ================
+Total Messages Expected: 2000000
+Total Messages Received: 2000000
+Total Messages Lost:     0
+Order Errors:            0
+Active Sender Processes: 12
+  - Sender ID 1: 166667 messages received
+  - Sender ID 2: 166667 messages received
+  - Sender ID 3: 166667 messages received
+  - Sender ID 4: 166667 messages received
+  - Sender ID 5: 166667 messages received
+  - Sender ID 6: 166667 messages received
+  - Sender ID 7: 166667 messages received
+  - Sender ID 8: 166667 messages received
+  - Sender ID 9: 166666 messages received
+  - Sender ID 10: 166666 messages received
+  - Sender ID 11: 166666 messages received
+  - Sender ID 12: 166666 messages received
+Elapsed Time:            23704 ms (23.70 s)
+Throughput:              84374 msg/s
+========================================================================
+

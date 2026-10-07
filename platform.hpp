@@ -125,6 +125,15 @@ namespace TLP
 
     
 
+#ifdef Windows
+#define T_CPU_PAUSE() YieldProcessor()
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#define T_CPU_PAUSE() __builtin_ia32_pause()
+#else
+#define T_CPU_PAUSE() ((void)0)
+#endif
+
+
     //
     template <class T> class ScopedLock
     {
@@ -132,25 +141,34 @@ namespace TLP
         //
         explicit ScopedLock(T& objMutex) : m_objMutex(objMutex)
         {
-            m_objMutex.Lock();
+            m_rc = m_objMutex.Lock();
         }
 
         //
         ScopedLock(T& objMutex, long milliseconds) : m_objMutex(objMutex)
         {
-            m_objMutex.Lock(milliseconds);
+            m_rc = m_objMutex.Lock(milliseconds);
+        }
+
+        T_BOOL IsLocked() const
+        {
+            return (m_rc == RC::SUCCESS || m_rc == RC::ABANDONED);
         }
 
         //
         virtual ~ScopedLock()
         {
-            try {
-                m_objMutex.Unlock();
-            }catch (...){
+            if (IsLocked())
+            {
+                try {
+                    m_objMutex.Unlock();
+                }catch (...){
+                }
             }
         }
 
     private:
+        RC m_rc;
         T& m_objMutex;
         ScopedLock();
         ScopedLock(const ScopedLock&);
@@ -251,21 +269,32 @@ namespace TLP
     template <class T> class TMsgQueue
     {
     public:
+        static const T_UINT32 CAPACITY = 4096;
+
+        TMsgQueue() : m_nHead(0), m_nTail(0), m_nCount(0)
+        {
+        }
 
         T_VOID Push(T& r)
         {
             ScopedLock<GenericMutex> lock(m_mQueueMutex);
-            m_msgQueue.push(r);
+            if (m_nCount < CAPACITY)
+            {
+                m_array[m_nTail] = r;
+                m_nTail = (m_nTail + 1) % CAPACITY;
+                m_nCount++;
+            }
         }
 
         T_BOOL Pop(T& r) 
         {
             T_BOOL bPop = T_FALSE;
             ScopedLock<GenericMutex> lock(m_mQueueMutex);
-            if (!m_msgQueue.empty())
+            if (m_nCount > 0)
             {
-                r = m_msgQueue.front();
-                m_msgQueue.pop();
+                r = m_array[m_nHead];
+                m_nHead = (m_nHead + 1) % CAPACITY;
+                m_nCount--;
                 bPop = T_TRUE;
             }
             return bPop;
@@ -274,12 +303,15 @@ namespace TLP
         T_UINT64 Size()
         {
             ScopedLock<GenericMutex> lock(m_mQueueMutex);
-            return m_msgQueue.size();
+            return m_nCount;
         }
 
     private:
         GenericMutex    m_mQueueMutex;
-        std::queue<T>   m_msgQueue;
+        T_UINT32        m_nHead;
+        T_UINT32        m_nTail;
+        T_UINT32        m_nCount;
+        T               m_array[CAPACITY];
     };
 
 
@@ -288,7 +320,7 @@ namespace TLP
     T_ID        TGetThreadId();
     T_UINT32    TGetError();
     T_PTSTR     TGetErrorMessage(T_UINT32 nErrorCode);
-    T_VOID      TSleep(UINT32 nMilliseconds);
+    T_VOID      TSleep(T_UINT32 nMilliseconds);
     T_VOID      TFree(T_PVOID pBuffer);
     T_STRING    TMakeGuid();
     T_HANDLE    TCreateEvent();
@@ -297,5 +329,7 @@ namespace TLP
     T_BOOL      TFileExist(T_PCSTR pDirFile);
     T_BOOL      TMakeDirectory(T_PCSTR pDirPathName);
     RC          TShellRun(T_PCSTR pFile, T_PCSTR pParams);
+    T_BOOL      TCheckProcAlive(T_ID nProcId);
+    T_UINT32    TComputeCRC32(T_PCVOID pData, T_UINT32 nLength);
 
 };

@@ -69,11 +69,19 @@ namespace TLP
         RC                    DumpUnread();
         RC                    IncDecSubscriber(T_BOOL bIncrease);
 
+        TPRingSlot            GetSlot(T_UINT32 nIndex);
+        RC                    WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nOutMsgId, T_ID nSenderProcId);
+        RC                    ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32& nOutSize, T_MSG_ID& nOutMsgId, T_ID& nOutSenderProcId);
+        RC                    AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken);
+        RC                    CommitRingBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte, T_ID nSenderProcId, T_MSG_ID& nOutMsgId);
+        T_UINT64              GetMinSubscriberSequence();
+        T_VOID                CleanZombieSubscribers();
+
     protected:
         RC Realloc(T_UINT32 nSizeInByte);
     private:
         SharedMemory*        m_pSharedMemory;
-        UINT32               m_nDataOffset;
+        T_UINT32             m_nDataOffset;
         TPChannelShmHeader   m_pChannelHeader;
         NamedMutex*          m_pChannelHdrMutex;
         NamedMutex*          m_pChannelDataMutex;
@@ -90,6 +98,8 @@ namespace TLP
         virtual ~CChannel();
 
         RC Publish(T_PCVOID pData, T_UINT32 nSizeInByte);
+        RC AcquireBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken);
+        RC CommitBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte = 0);
         RC Subscribe(OpenFlag nFlag, T_BOOL bGlobal);
         RC Unsubscribe(T_ID nProcId);
 
@@ -100,6 +110,7 @@ namespace TLP
         T_BOOL   IsOpenned();
         RC       WaitAllEventDone();
         T_SHORT  GetSubscriberCount();
+        CChannelData* GetChannelData() { return m_pChannelData; }
         
 
     protected:
@@ -255,6 +266,12 @@ namespace TLP
         // nSizeInByte: The length in byte of pData
         //
         static RC Send(T_ID nChannelId, T_PCVOID pData, T_UINT32 nSizeInByte);
+
+        //
+        // Zero-Copy APIs
+        //
+        static RC AcquireBuffer(T_ID nChannelId, T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken);
+        static RC CommitBuffer(T_ID nChannelId, T_UINT64 nToken, T_UINT32 nSizeInByte = 0);
 
         //
         // bSendMsgBeforeClose: 

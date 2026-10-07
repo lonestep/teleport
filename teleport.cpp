@@ -17,12 +17,15 @@ CChannelBase::CChannelBase():
     m_bStopped(T_FALSE),
     m_hStopEvent(T_INVHDL)
 { 
+    m_hStopEvent = TCreateEvent();
 }
 
 
 //
 CChannelBase::~CChannelBase()
 { 
+    Stop();
+    SAFE_CLOSE_HANDLE(m_hStopEvent);
 }
 
 
@@ -146,7 +149,7 @@ RC ITeleport::Open(T_PCSTR strChannelName,
 //
 RC ITeleport::Send(T_ID nChannelId, T_PCVOID pData, T_UINT32 nSizeInByte)
 {
-    if (nSizeInByte > MAX_SHM_SIZE)
+    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
     {
         return RC::EXCEED_LIMIT;
     }
@@ -154,6 +157,30 @@ RC ITeleport::Send(T_ID nChannelId, T_PCVOID pData, T_UINT32 nSizeInByte)
     if (pChannel)
     {
         return pChannel->Publish(pData, nSizeInByte);
+    }
+    return RC::NOT_FOUND;
+}
+
+
+//
+RC ITeleport::AcquireBuffer(T_ID nChannelId, T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+{
+    CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
+    if (pChannel)
+    {
+        return pChannel->AcquireBuffer(nSizeInByte, pBuffer, nToken);
+    }
+    return RC::NOT_FOUND;
+}
+
+
+//
+RC ITeleport::CommitBuffer(T_ID nChannelId, T_UINT64 nToken, T_UINT32 nSizeInByte)
+{
+    CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
+    if (pChannel)
+    {
+        return pChannel->CommitBuffer(nToken, nSizeInByte);
     }
     return RC::NOT_FOUND;
 }
@@ -478,7 +505,6 @@ CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T
     {
         LogVital("CChannel: Failed to create CChannelData object!");
     }
-    m_hStopEvent = hStopEvent;
     Start();
 }
 
@@ -504,33 +530,59 @@ CChannel::~CChannel()
 //
 RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
 {
-    if(!m_bActivated)
+    if (!m_bActivated)
     {
         return RC::CLOSED;
     }
-    T_UINT32 nThrottleYield = 0;
-    while (m_qPubQueue.Size() >= 2000 && !m_bStopped)
+    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
     {
-        if (++nThrottleYield % 50 == 0)
+        return RC::EXCEED_LIMIT;
+    }
+    T_MSG_ID nOutMsgId = 0;
+    m_bWriting = T_TRUE;
+    RC rc = m_pChannelData->WriteRingMsg(pData, nSizeInByte, nOutMsgId, m_nProcId);
+    m_bWriting = T_FALSE;
+    if (IS_SUCCESS(rc))
+    {
+        T_UINT64 minSeq = m_pChannelData->GetMinSubscriberSequence();
+        if ((nOutMsgId - minSeq <= 4) || ((nOutMsgId & 31) == 0))
         {
-            TSleep(1);
-        }
-        else
-        {
-            TSleep(0);
+            m_pEventSubRead->Post(T_FALSE);
         }
     }
-    TPubMessage msg = {0};
-    msg.pData = malloc(nSizeInByte);
-    if(msg.pData)
+    return rc;
+}
+
+
+//
+RC CChannel::AcquireBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+{
+    if (!m_bActivated)
     {
-        memcpy(msg.pData, pData, nSizeInByte);
-        msg.nLength = nSizeInByte;
-        msg.nOriginalMsgId = MakeMsgId();
-        m_qPubQueue.Push(msg);
-        return RC::SUCCESS;
+        return RC::CLOSED;
     }
-    return RC::FAILED;
+    return m_pChannelData->AcquireRingBuffer(nSizeInByte, pBuffer, nToken);
+}
+
+
+//
+RC CChannel::CommitBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte)
+{
+    if (!m_bActivated)
+    {
+        return RC::CLOSED;
+    }
+    T_MSG_ID nOutMsgId = 0;
+    RC rc = m_pChannelData->CommitRingBuffer(nToken, nSizeInByte, m_nProcId, nOutMsgId);
+    if (IS_SUCCESS(rc))
+    {
+        T_UINT64 minSeq = m_pChannelData->GetMinSubscriberSequence();
+        if ((nOutMsgId - minSeq <= 4) || ((nOutMsgId & 31) == 0))
+        {
+            m_pEventSubRead->Post(T_FALSE);
+        }
+    }
+    return rc;
 }
 
 
@@ -541,12 +593,20 @@ RC CChannel::Subscribe(OpenFlag Flag, T_BOOL bGlobal)
     TPAckRecord pRecord = m_pChannelData->GetFirstAvailRecord();
     if (!pRecord)
     {
+        m_pChannelData->CleanZombieSubscribers();
+        pRecord = m_pChannelData->GetFirstAvailRecord();
+    }
+    if (!pRecord)
+    {
         m_pChannelData->UnlockHdr();
         return RC::EXCEED_LIMIT;
     }
     LogInfo("Channel#%d proc %d was subscribed.", m_nChannelId, m_nProcId);
-    pRecord->ProcId           = m_nProcId;
+    pRecord->ProcId        = m_nProcId;
     pRecord->AckFlag       = ACK_FLAG::INIT;
+    pRecord->LastReadSeq   = m_pChannelData->GetShmHeader()->PubHeader.WriteCursor;
+    pRecord->HeartbeatTick = 0;
+    pRecord->Status        = 1;
     RC rc = AddSession(Flag, pRecord);
     m_pChannelData->UnlockHdr();
     CHK_RC(rc);
@@ -563,8 +623,11 @@ RC CChannel::Unsubscribe(T_ID nProcId)
     {
         return RC::SUCCESS;
     }
+    Stop();
     m_pChannelData->LockHdr();
     m_pAckRecord->ProcId = 0;
+    m_pAckRecord->LastReadSeq = 0;
+    m_pAckRecord->AckFlag = ACK_FLAG::NONE;
     m_pChannelData->UnlockHdr();
     m_pChannelData->IncDecSubscriber(T_FALSE);
     
@@ -575,12 +638,7 @@ RC CChannel::Unsubscribe(T_ID nProcId)
     }
     RC rc = RemoveSession(GetSessionId());
     CHK_RC(rc);
-    if(m_mSessions.size() > 0)
-    {
-        return rc;
-    }
-    Stop();
-    memset(m_pAckRecord, 0, sizeof(TAckRecord));
+    memset((void*)m_pAckRecord, 0, sizeof(TAckRecord));
     m_pAckRecord = T_NULL;
     return RC::SUCCESS;
 }
@@ -638,10 +696,15 @@ TSessionId CChannel::GetSessionId()
 RC CChannel::WaitAllEventDone()
 {
     m_bActivated = T_FALSE;
-    while (m_qPubQueue.Size() > 0 || m_qCallbackQueue.Size() > 0 || m_bWriting)
+    T_UINT64 writeCursor = m_pChannelData->GetShmHeader()->PubHeader.WriteCursor;
+    T_UINT32 nWait = 0;
+    while (m_pChannelData->GetMinSubscriberSequence() < writeCursor && nWait++ < 500)
     {
-        //LogInfo("Waiting messages to be sent before close.");
         TSleep(10);
+    }
+    while (m_bWriting || m_qPubQueue.Size() > 0 || m_qCallbackQueue.Size() > 0)
+    {
+        TSleep(1);
     }
     return RC::SUCCESS;
 }
@@ -786,18 +849,13 @@ RC CChannel::RunPubThread()
 {
     TPubMessage msg;
     LogInfo("Channel %s(#%d) RunPubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    // PUB_MSG_INTERVAL will affect the response efficiency on stop event
-    // Also, affect the speed publishing messages & CPU usage
     while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
         if (m_qPubQueue.Pop(msg))
         {
-            RC rc = m_pChannelData->Lock();
-            m_bWriting = T_TRUE;
-            WriteMsg(msg);
-            m_bWriting = T_FALSE;
-            rc = m_pChannelData->Unlock();
-            CHK_RC(rc);
+            T_MSG_ID nOutMsgId = 0;
+            m_pChannelData->WriteRingMsg(msg.pData, msg.nLength, nOutMsgId, m_nProcId);
+            m_pEventSubRead->Post(T_FALSE);
             SAFE_FREE_POINTER(msg.pData);
         }
         else
@@ -818,24 +876,52 @@ RC CChannel::RunPubThread()
 RC CChannel::RunSubThread()
 {
     LogInfo("Channel %s(#%d) RunSubThread() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
-    TPChannelShmHeader pHeader = m_pChannelData->GetShmHeader();
-    T_MSG_ID nLastMsgId  = 0;
-    T_ID     nLastProcId = 0;
     while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
-        RC rc = m_pEventSubRead->Wait(1000);
-        if (IS_SUCCESS(rc) && m_pAckRecord)
+        if (!m_pAckRecord)
         {
-            //Re-entering
-            if( (m_pAckRecord->AckFlag != ACK_FLAG::INIT)||
-                (nLastMsgId == pHeader->nOriginalMsgId && nLastProcId == pHeader->nOriginalProcId) )
+            TSleep(10);
+            continue;
+        }
+
+        T_PVOID pData = T_NULL;
+        T_UINT32 nSize = 0;
+        T_MSG_ID nMsgId = 0;
+        T_ID nSenderProcId = 0;
+
+        RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nMsgId, nSenderProcId);
+        if (IS_SUCCESS(rc))
+        {
+            if (m_pCallback)
             {
-                TSleep(0);
-                continue;
+                TCbMessage cbMsg;
+                cbMsg.eType = MsgType::MSG_SUB_GET;
+                cbMsg.nChannelId = m_nChannelId;
+                cbMsg.nProcessId = nSenderProcId;
+                cbMsg.nOriginalMsgId = nMsgId;
+                cbMsg.eResult = RC::SUCCESS;
+                cbMsg.pData = pData;
+                cbMsg.nLength = nSize;
+                m_pCallback(&cbMsg);
             }
-            nLastMsgId  = pHeader->nOriginalMsgId;
-            nLastProcId = pHeader->nOriginalProcId;
-            ReadMsg(nLastProcId, nLastMsgId);
+            m_pAckRecord->LastReadSeq = nMsgId;
+            m_pAckRecord->AckFlag = ACK_FLAG::DONE;
+            if (m_pChannelData->GetShmHeader()->PubHeader.WriteCursor - nMsgId >= RING_SLOT_COUNT - 64)
+            {
+                m_pEventReadDone->Post(T_FALSE);
+            }
+            continue;
+        }
+        else if (rc == RC::FAILED)
+        {
+            LogWarn("Channel %s: Discarding corrupted slot sequence %llu",
+                m_strChannelName.c_str(), (T_UINT64)(m_pAckRecord->LastReadSeq + 1));
+            m_pAckRecord->LastReadSeq++;
+            continue;
+        }
+        else
+        {
+            m_pEventSubRead->Wait(1);
         }
     }
     LogInfo("Channel %s(#%d) RunSubThread() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -847,39 +933,31 @@ RC CChannel::RunSubThread()
 //
 RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
 {
-    T_PVOID pData        = T_NULL;
-    T_UINT32 nDataLength = 0;
-    RC rc                = m_pChannelData->Read(pData, nDataLength);
-
-    if(IS_FAILED(rc))
+    if (!m_pAckRecord)
     {
-        LogWarn("Channel %s(#%d) proc#%d Read failed:rc=%d.", 
-            m_strChannelName.c_str(), 
-            (T_UINT32)m_nChannelId, 
-            nProcId,
-            rc);
-
-        m_pAckRecord->AckFlag = ACK_FLAG::DONE;
-        T_BOOL bReadDone = m_pChannelData->SetRead();
-        if (bReadDone)
-        {
-            m_pEventSubRead->Reset();
-            m_pEventReadDone->Post(T_FALSE);
-        }
-        return rc;
+        return RC::FAILED;
     }
-    rc = PutCallbackMsg(MsgType::MSG_SUB_GET,
-        nMsgId,
-        nProcId,
-        pData,
-        nDataLength,
-        RC::SUCCESS);
-
-    m_pAckRecord->AckFlag = ACK_FLAG::DONE;
-    T_BOOL bReadDone = m_pChannelData->SetRead();
-    if (bReadDone)
+    T_PVOID pData = T_NULL;
+    T_UINT32 nSize = 0;
+    T_MSG_ID nOutMsgId = 0;
+    T_ID nSenderProcId = 0;
+    RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nOutMsgId, nSenderProcId);
+    if (IS_SUCCESS(rc))
     {
-        m_pEventSubRead->Reset();
+        if (m_pCallback)
+        {
+            TCbMessage cbMsg;
+            cbMsg.eType = MsgType::MSG_SUB_GET;
+            cbMsg.nChannelId = m_nChannelId;
+            cbMsg.nProcessId = nSenderProcId;
+            cbMsg.nOriginalMsgId = nOutMsgId;
+            cbMsg.eResult = RC::SUCCESS;
+            cbMsg.pData = pData;
+            cbMsg.nLength = nSize;
+            m_pCallback(&cbMsg);
+        }
+        m_pAckRecord->LastReadSeq = nOutMsgId;
+        m_pAckRecord->AckFlag = ACK_FLAG::DONE;
         m_pEventReadDone->Post(T_FALSE);
     }
     return rc;
@@ -889,36 +967,11 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
 //
 RC CChannel::WriteMsg(TPubMessage& msg)
 {
-    RC rc = m_pChannelData->Write(msg.pData, msg.nLength);
-    if(FAILED(rc)) 
+    T_MSG_ID nOutMsgId = 0;
+    RC rc = m_pChannelData->WriteRingMsg(msg.pData, msg.nLength, nOutMsgId, m_nProcId);
+    if (IS_SUCCESS(rc))
     {
-        LogWarn("Channel data write failed: Proc#%d Message:%lld", m_nProcId, msg.nOriginalMsgId);
-        OnPubAckFailed(msg.nOriginalMsgId);
-        return rc;
-    }
-    rc = PutCallbackMsg(MsgType::MSG_PUB_PUT, msg.nOriginalMsgId, m_nProcId);
-    rc = m_pChannelData->SetUnread(msg.nOriginalMsgId, m_nProcId);
-    if (m_pChannelData->GetShmHeader()->nUnreadCnt > 0)
-    {
-        m_pEventReadDone->Reset();
-        m_pEventSubRead->Reset();
-        rc = m_pEventSubRead->Post(T_FALSE);
-        rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
-
-        if (IS_FAILED(rc))
-        {
-            LogWarn("Read done failed: Proc#%d Message:%lld, try again...", m_nProcId, msg.nOriginalMsgId);
-            m_pChannelData->DumpUnread();
-            rc = m_pEventSubRead->Post(T_FALSE);
-            rc = m_pEventReadDone->Wait(PUB_ACK_TIMEOUT);
-            if (IS_FAILED(rc))
-            {
-                LogWarn("Read done failed again: Proc#%d Message:%lld, give up.", m_nProcId, msg.nOriginalMsgId);
-                rc = OnPubAckFailed(msg.nOriginalMsgId);
-            }
-        }
-        m_pEventSubRead->Reset();
-        m_pEventReadDone->Reset();
+        m_pEventSubRead->Post(T_FALSE);
     }
     return rc;
 }
@@ -931,23 +984,21 @@ RC CChannel::RunCallback()
     LogInfo("Channel %s(#%d) RunCallback() start.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
     while (WAIT_OBJECT_0 != WaitForSingleObject(m_hStopEvent, 0) && !m_bStopped)
     {
-        RC rc = m_pEventCallback->Wait(1000);
+        RC rc = m_pEventCallback->Wait(100);
+        m_pEventCallback->Reset();
+        while (m_pCallback && m_qCallbackQueue.Pop(msg))
         {
-            m_pEventCallback->Reset();
-            while (m_pCallback && m_qCallbackQueue.Pop(msg))
+            m_pCallback(&msg);
+            if(msg.eType == MsgType::MSG_SUB_GET && msg.pData)
             {
-                m_pCallback(&msg);
-                if(msg.eType == MsgType::MSG_SUB_GET)
-                {
-                    SAFE_FREE_POINTER(msg.pData);
-                }
+                SAFE_FREE_POINTER(msg.pData);
             }
         }
     }
     while (m_pCallback && m_qCallbackQueue.Pop(msg))
     {
         m_pCallback(&msg);
-        if(msg.eType == MsgType::MSG_SUB_GET)
+        if(msg.eType == MsgType::MSG_SUB_GET && msg.pData)
         {
             SAFE_FREE_POINTER(msg.pData);
         }
@@ -980,6 +1031,23 @@ CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte) :
     }
     m_pChannelHeader = (TPChannelShmHeader)m_pSharedMemory->Begin();
     m_pShmDataAddr   = m_pSharedMemory->Begin() + m_nDataOffset;
+
+    LockHdr();
+    if (m_pChannelHeader->nMagic != TELEPORT_MAGIC)
+    {
+        m_pChannelHeader->nMagic          = TELEPORT_MAGIC;
+        m_pChannelHeader->nVersion        = TELEPORT_VERSION;
+        m_pChannelHeader->nUnreadCnt      = 0;
+        m_pChannelHeader->nSubscribers    = 0;
+        m_pChannelHeader->nOriginalMsgId  = 0;
+        m_pChannelHeader->nOriginalProcId = 0;
+        m_pChannelHeader->nSlotCount      = RING_SLOT_COUNT;
+        m_pChannelHeader->nSlotSize       = sizeof(TRingSlot);
+        m_pChannelHeader->PubHeader.WriteCursor  = 0;
+        m_pChannelHeader->PubHeader.CommitCursor = 0;
+        memset((void*)m_pChannelHeader->AckRecords, 0, sizeof(m_pChannelHeader->AckRecords));
+    }
+    UnlockHdr();
 }
 
 
@@ -1010,57 +1078,23 @@ CChannelData::~CChannelData()
 //
 RC CChannelData::Write(T_PCVOID pData, T_UINT32 nSizeInByte)
 {
-    
-    T_UINT32 nShmSize = m_pSharedMemory->GetSize() - m_nDataOffset;
-    //if (nSizeInByte > nShmSize)
-    //{
-    //    RC rc = Realloc(nSizeInByte);
-    //    if(!IS_SUCCESS(rc))
-    //    {
-    //        return rc;
-    //    }
-    //    nShmSize = m_pSharedMemory->GetSize() - m_nDataOffset;
-    //}
-    TTRY
-    {
-        *((T_PUINT32)m_pShmDataAddr) = nSizeInByte;
-        memcpy_s(m_pShmDataAddr + sizeof(T_UINT32),
-            nShmSize,
-            pData,
-            nSizeInByte);
-    }
-    TEXCEPT_EXECUTE_HANDLER
-    {
-        LogError("CChannelData::Write failed.");
-        return RC::FAILED;
-    }
-    return RC::SUCCESS;
+    T_MSG_ID nOutMsgId = 0;
+    return WriteRingMsg(pData, nSizeInByte, nOutMsgId, 0);
 }
 
 
 //
 RC CChannelData::Read(T_PVOID& pData, T_UINT32& nSizeInByte)
 {
-    TTRY
+    TPRingSlot pSlot = GetSlot((T_UINT32)(m_pChannelHeader->PubHeader.CommitCursor & RING_SLOT_MASK));
+    nSizeInByte = pSlot->nLength;
+    pData = malloc(nSizeInByte + 2);
+    if (!pData)
     {
-        nSizeInByte = *((T_PUINT32)m_pShmDataAddr);
-        pData = malloc(nSizeInByte + 2);
-        if(!pData)
-        {
-            return RC::OUT_OF_MEMORY;
-        }
-        memset(pData, 0, nSizeInByte + 2);
-        memcpy_s(pData,
-        nSizeInByte,
-        m_pShmDataAddr + sizeof(T_UINT32),
-        nSizeInByte);
+        return RC::OUT_OF_MEMORY;
     }
-    TEXCEPT_EXECUTE_HANDLER
-    {
-        pData = T_NULL;
-        nSizeInByte = 0;
-        return RC::FAILED;
-    }
+    memset(pData, 0, nSizeInByte + 2);
+    memcpy_s(pData, nSizeInByte, (const void*)pSlot->Data, nSizeInByte);
     return RC::SUCCESS;
 }
 
@@ -1068,7 +1102,13 @@ RC CChannelData::Read(T_PVOID& pData, T_UINT32& nSizeInByte)
 //
 RC CChannelData::Lock()
 {
-    return m_pChannelDataMutex->Lock();
+    RC rc = m_pChannelDataMutex->Lock();
+    if (rc == RC::ABANDONED)
+    {
+        LogWarn("Channel data mutex abandoned, recovered.");
+        return RC::SUCCESS;
+    }
+    return rc;
 }
 
 
@@ -1082,7 +1122,13 @@ RC CChannelData::Unlock()
 //
 RC CChannelData::LockHdr()
 {
-    return m_pChannelHdrMutex->Lock();
+    RC rc = m_pChannelHdrMutex->Lock();
+    if (rc == RC::ABANDONED)
+    {
+        LogWarn("Channel hdr mutex abandoned, recovered.");
+        return RC::SUCCESS;
+    }
+    return rc;
 }
 
 
@@ -1192,6 +1238,341 @@ RC CChannelData::IncDecSubscriber(T_BOOL bIncrease)
     {
         m_pChannelHeader->nSubscribers--;
     }
+    return RC::SUCCESS;
+}
+
+
+//
+TPRingSlot CChannelData::GetSlot(T_UINT32 nIndex)
+{
+    T_UINT32 nIdx = nIndex & RING_SLOT_MASK;
+    return (TPRingSlot)(m_pShmDataAddr + (nIdx * sizeof(TRingSlot)));
+}
+
+
+//
+T_VOID CChannelData::CleanZombieSubscribers()
+{
+    ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
+    TPAckRecord pRecord = m_pChannelHeader->AckRecords;
+    for (T_UINT32 i = 0; i < MAX_SUBSCRIBERS_PER_CHANNEL; i++)
+    {
+        if (pRecord->ProcId != 0)
+        {
+            if (!TCheckProcAlive(pRecord->ProcId))
+            {
+                LogWarn("Zombie subscriber (ProcId: %d) cleaned up.", pRecord->ProcId);
+                pRecord->ProcId = 0;
+                pRecord->LastReadSeq = 0;
+                pRecord->AckFlag = ACK_FLAG::NONE;
+                if (m_pChannelHeader->nSubscribers > 0)
+                {
+                    m_pChannelHeader->nSubscribers--;
+                }
+            }
+        }
+        pRecord++;
+    }
+}
+
+
+//
+T_UINT64 CChannelData::GetMinSubscriberSequence()
+{
+    T_SHORT nTotalSubs = m_pChannelHeader->nSubscribers;
+    if (nTotalSubs <= 0)
+    {
+        return m_pChannelHeader->PubHeader.WriteCursor;
+    }
+    T_UINT64 nMinSeq = UINT64_MAX;
+    T_SHORT nFound = 0;
+    TPAckRecord pRecord = m_pChannelHeader->AckRecords;
+    for (T_UINT32 i = 0; i < MAX_SUBSCRIBERS_PER_CHANNEL && nFound < nTotalSubs; i++)
+    {
+        if (pRecord->ProcId != 0)
+        {
+            nFound++;
+            T_UINT64 nSeq = pRecord->LastReadSeq;
+            if (nSeq < nMinSeq)
+            {
+                nMinSeq = nSeq;
+            }
+        }
+        pRecord++;
+    }
+    if (nFound == 0)
+    {
+        return m_pChannelHeader->PubHeader.WriteCursor;
+    }
+    return nMinSeq;
+}
+
+
+//
+RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nOutMsgId, T_ID nSenderProcId)
+{
+    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    {
+        return RC::EXCEED_LIMIT;
+    }
+
+    T_UINT64 nextSeq = 0;
+    T_UINT32 nSpin = 0;
+    T_UINT64 cachedMinSeq = 0;
+    while (true)
+    {
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
+        {
+            cachedMinSeq = GetMinSubscriberSequence();
+            if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
+            {
+                if (++nSpin < 200)
+                {
+                    T_CPU_PAUSE();
+                }
+                else
+                {
+                    CleanZombieSubscribers();
+                    cachedMinSeq = GetMinSubscriberSequence();
+                    TSleep(1);
+                }
+                continue;
+            }
+        }
+
+        nextSeq = currentWrite + 1;
+#ifdef Windows
+        if ((T_UINT64)InterlockedCompareExchange64(
+            (LONG64*)&m_pChannelHeader->PubHeader.WriteCursor,
+            (LONG64)nextSeq,
+            (LONG64)currentWrite) == currentWrite)
+        {
+            break;
+        }
+#else
+        if (__sync_bool_compare_and_swap(
+            &m_pChannelHeader->PubHeader.WriteCursor,
+            currentWrite,
+            nextSeq))
+        {
+            break;
+        }
+#endif
+        T_CPU_PAUSE();
+    }
+
+    TPRingSlot pSlot = GetSlot((T_UINT32)(nextSeq & RING_SLOT_MASK));
+    pSlot->nMagic = 0;
+    if (pData && nSizeInByte > 0)
+    {
+        memcpy((void*)pSlot->Data, pData, nSizeInByte);
+    }
+    if (nSizeInByte < MAX_SLOT_DATA_SIZE)
+    {
+        pSlot->Data[nSizeInByte] = 0;
+    }
+    pSlot->nLength = nSizeInByte;
+    pSlot->nSenderProcId = nSenderProcId;
+    pSlot->nChecksum = TComputeCRC32((void*)pSlot->Data, nSizeInByte);
+    pSlot->nFlags = 0;
+    pSlot->nReserved = 0;
+    pSlot->nMagic = TELEPORT_MAGIC;
+
+#ifdef Windows
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    pSlot->nSequence = nextSeq;
+
+    T_UINT64 commitCur = m_pChannelHeader->PubHeader.CommitCursor;
+    if (commitCur + 1 == nextSeq)
+    {
+#ifdef Windows
+        InterlockedCompareExchange64(
+            (LONG64*)&m_pChannelHeader->PubHeader.CommitCursor,
+            (LONG64)nextSeq,
+            (LONG64)commitCur);
+#else
+        __sync_bool_compare_and_swap(
+            &m_pChannelHeader->PubHeader.CommitCursor,
+            commitCur,
+            nextSeq);
+#endif
+    }
+
+    nOutMsgId = nextSeq;
+    m_pChannelHeader->nOriginalMsgId = nextSeq;
+    m_pChannelHeader->nOriginalProcId = nSenderProcId;
+    return RC::SUCCESS;
+}
+
+
+//
+RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+{
+    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    {
+        return RC::EXCEED_LIMIT;
+    }
+
+    T_UINT64 nextSeq = 0;
+    T_UINT32 nSpin = 0;
+    T_UINT64 cachedMinSeq = 0;
+    while (true)
+    {
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
+        {
+            cachedMinSeq = GetMinSubscriberSequence();
+            if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
+            {
+                if (++nSpin < 200)
+                {
+                    T_CPU_PAUSE();
+                }
+                else
+                {
+                    CleanZombieSubscribers();
+                    cachedMinSeq = GetMinSubscriberSequence();
+                    TSleep(1);
+                }
+                continue;
+            }
+        }
+
+        nextSeq = currentWrite + 1;
+#ifdef Windows
+        if ((T_UINT64)InterlockedCompareExchange64(
+            (LONG64*)&m_pChannelHeader->PubHeader.WriteCursor,
+            (LONG64)nextSeq,
+            (LONG64)currentWrite) == currentWrite)
+        {
+            break;
+        }
+#else
+        if (__sync_bool_compare_and_swap(
+            &m_pChannelHeader->PubHeader.WriteCursor,
+            currentWrite,
+            nextSeq))
+        {
+            break;
+        }
+#endif
+        T_CPU_PAUSE();
+    }
+
+    TPRingSlot pSlot = GetSlot((T_UINT32)(nextSeq & RING_SLOT_MASK));
+    pSlot->nMagic = 0;
+    pSlot->nLength = nSizeInByte;
+    pBuffer = (T_PVOID)pSlot->Data;
+    nToken = nextSeq;
+    return RC::SUCCESS;
+}
+
+
+//
+RC CChannelData::CommitRingBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte, T_ID nSenderProcId, T_MSG_ID& nOutMsgId)
+{
+    T_UINT64 seq = nToken;
+    TPRingSlot pSlot = GetSlot((T_UINT32)(seq & RING_SLOT_MASK));
+    if (nSizeInByte == 0)
+    {
+        nSizeInByte = pSlot->nLength;
+    }
+    if (nSizeInByte < MAX_SLOT_DATA_SIZE)
+    {
+        pSlot->Data[nSizeInByte] = 0;
+    }
+    pSlot->nLength = nSizeInByte;
+    pSlot->nSenderProcId = nSenderProcId;
+    pSlot->nChecksum = TComputeCRC32((void*)pSlot->Data, nSizeInByte);
+    pSlot->nFlags = 0;
+    pSlot->nReserved = 0;
+    pSlot->nMagic = TELEPORT_MAGIC;
+
+#ifdef Windows
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    pSlot->nSequence = seq;
+
+    T_UINT64 commitCur = m_pChannelHeader->PubHeader.CommitCursor;
+    if (commitCur + 1 == seq)
+    {
+#ifdef Windows
+        InterlockedCompareExchange64(
+            (LONG64*)&m_pChannelHeader->PubHeader.CommitCursor,
+            (LONG64)seq,
+            (LONG64)commitCur);
+#else
+        __sync_bool_compare_and_swap(
+            &m_pChannelHeader->PubHeader.CommitCursor,
+            commitCur,
+            seq);
+#endif
+    }
+
+    nOutMsgId = seq;
+    m_pChannelHeader->nOriginalMsgId = seq;
+    m_pChannelHeader->nOriginalProcId = nSenderProcId;
+    return RC::SUCCESS;
+}
+
+
+//
+RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32& nOutSize, T_MSG_ID& nOutMsgId, T_ID& nOutSenderProcId)
+{
+    if (!pSubRecord)
+    {
+        return RC::INVALID_PARAM;
+    }
+
+    T_UINT64 targetSeq = pSubRecord->LastReadSeq + 1;
+    TPRingSlot pSlot = GetSlot((T_UINT32)(targetSeq & RING_SLOT_MASK));
+
+    if (pSlot->nSequence < targetSeq)
+    {
+        for (T_UINT32 i = 0; i < 200; i++)
+        {
+            T_CPU_PAUSE();
+            if (pSlot->nSequence >= targetSeq)
+            {
+                break;
+            }
+        }
+    }
+
+    if (pSlot->nSequence != targetSeq)
+    {
+        return RC::TIMEOUT;
+    }
+
+    if (pSlot->nMagic != TELEPORT_MAGIC)
+    {
+        LogError("CChannelData::ReadRingMsg: Magic corrupted on seq %llu", targetSeq);
+        return RC::FAILED;
+    }
+
+    if (pSlot->nLength > MAX_SLOT_DATA_SIZE)
+    {
+        LogError("CChannelData::ReadRingMsg: Slot data length exceed limit (%u) on seq %llu", pSlot->nLength, targetSeq);
+        return RC::FAILED;
+    }
+
+    T_UINT32 nCrc = TComputeCRC32((void*)pSlot->Data, pSlot->nLength);
+    if (nCrc != pSlot->nChecksum)
+    {
+        LogError("CChannelData::ReadRingMsg: CRC mismatch on seq %llu", targetSeq);
+        return RC::FAILED;
+    }
+
+    pOutData = (T_PVOID)pSlot->Data;
+    nOutSize = pSlot->nLength;
+    nOutMsgId = targetSeq;
+    nOutSenderProcId = pSlot->nSenderProcId;
     return RC::SUCCESS;
 }
 

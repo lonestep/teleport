@@ -1,0 +1,8 @@
+RunMPSend           		unittest.cpp(885)	[PASS]
+MP Sender 7 started: sending 166667 messages...
+Sender 7: Sent 50000 / 166667 | Elapsed: 7147 ms (6996 msg/s)
+Sender 7: Sent 100000 / 166667 | Elapsed: 14390 ms (6949 msg/s)
+Sender 7: Sent 150000 / 166667 | Elapsed: 21471 ms (6986 msg/s)
+Sender 7: Sent 166667 / 166667 | Elapsed: 23468 ms (7102 msg/s)
+RunMPSend           		unittest.cpp(924)	[PASS]
+Sender 7 complete: 166667 msgs in 23619 ms (7056 msg/s)

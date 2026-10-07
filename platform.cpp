@@ -270,6 +270,7 @@ NamedMutex::NamedMutex(T_PCSTR pName) :
 
 
 //
+#ifdef Windows
 RC BaseMutex::Lock(T_UINT32 nMilliseconds)
 {
     switch (WaitForSingleObject(m_hHandle, nMilliseconds))
@@ -313,6 +314,90 @@ RC BaseMutex::Unlock()
     }
     return RC::FAILED;
 }
+#else
+RC BaseMutex::Lock(T_UINT32 nMilliseconds)
+{
+    if (m_hHandle == T_INVHDL)
+    {
+        return RC::FAILED;
+    }
+    pthread_mutex_t* pMutex = (pthread_mutex_t*)m_hHandle;
+    int err = 0;
+    if (nMilliseconds == INFINITE)
+    {
+        err = pthread_mutex_lock(pMutex);
+    }
+    else
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += nMilliseconds / 1000;
+        ts.tv_nsec += (nMilliseconds % 1000) * 1000000;
+        if (ts.tv_nsec >= 1000000000)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+        err = pthread_mutex_timedlock(pMutex, &ts);
+    }
+    if (err == 0)
+    {
+        return RC::SUCCESS;
+    }
+    if (err == EOWNERDEAD)
+    {
+        pthread_mutex_consistent(pMutex);
+        return RC::ABANDONED;
+    }
+    if (err == ETIMEDOUT)
+    {
+        return RC::TIMEOUT;
+    }
+    return RC::FAILED;
+}
+
+
+//
+RC BaseMutex::TryLock(T_UINT32 nMilliseconds)
+{
+    if (m_hHandle == T_INVHDL)
+    {
+        return RC::FAILED;
+    }
+    pthread_mutex_t* pMutex = (pthread_mutex_t*)m_hHandle;
+    int err = pthread_mutex_trylock(pMutex);
+    if (err == 0)
+    {
+        return RC::SUCCESS;
+    }
+    if (err == EOWNERDEAD)
+    {
+        pthread_mutex_consistent(pMutex);
+        return RC::ABANDONED;
+    }
+    if (err == EBUSY)
+    {
+        return RC::TIMEOUT;
+    }
+    return RC::FAILED;
+}
+
+
+//
+RC BaseMutex::Unlock()
+{
+    if (m_hHandle == T_INVHDL)
+    {
+        return RC::FAILED;
+    }
+    pthread_mutex_t* pMutex = (pthread_mutex_t*)m_hHandle;
+    if (pthread_mutex_unlock(pMutex) == 0)
+    {
+        return RC::SUCCESS;
+    }
+    return RC::FAILED;
+}
+#endif
 
 
 //
@@ -374,7 +459,7 @@ SharedMemory::SharedMemory(T_PCSTR pName,
     }
     else
     {
-        LogInfo("CreateFileMappingA£º%s with mode:%d size:%d", m_strName, m_eMode, m_nSize);
+        LogInfo("CreateFileMappingAï¼š%s with mode:%d size:%d", m_strName, m_eMode, m_nSize);
     }
     Map();
 }
@@ -845,6 +930,66 @@ RC TLP::TShellRun(T_PCSTR pFile, T_PCSTR pParams)
 #else
     return RC::NOT_IMPLEMENTED;
 #endif
+}
+
+
+//
+T_BOOL TLP::TCheckProcAlive(T_ID nProcId)
+{
+    if (nProcId == 0)
+    {
+        return T_FALSE;
+    }
+    if (nProcId == TGetProcId())
+    {
+        return T_TRUE;
+    }
+#ifdef Windows
+    HANDLE hProcess = ::OpenProcess(SYNCHRONIZE, FALSE, (DWORD)nProcId);
+    if (!hProcess)
+    {
+        DWORD dwErr = ::GetLastError();
+        if (dwErr == ERROR_ACCESS_DENIED)
+        {
+            return T_TRUE;
+        }
+        return T_FALSE;
+    }
+    DWORD dwWait = ::WaitForSingleObject(hProcess, 0);
+    ::CloseHandle(hProcess);
+    if (dwWait == WAIT_TIMEOUT)
+    {
+        return T_TRUE;
+    }
+    return T_FALSE;
+#else
+    if (kill((pid_t)nProcId, 0) == 0)
+    {
+        return T_TRUE;
+    }
+    return (errno != ESRCH);
+#endif
+}
+
+
+//
+T_UINT32 TLP::TComputeCRC32(T_PCVOID pData, T_UINT32 nLength)
+{
+    if (!pData || nLength == 0)
+    {
+        return 0;
+    }
+    const T_UINT8* pBytes = (const T_UINT8*)pData;
+    T_UINT32 nCrc = 0xFFFFFFFF;
+    for (T_UINT32 i = 0; i < nLength; i++)
+    {
+        nCrc ^= pBytes[i];
+        for (T_UINT8 j = 0; j < 8; j++)
+        {
+            nCrc = (nCrc >> 1) ^ (0xEDB88320 & -(T_INT32)(nCrc & 1));
+        }
+    }
+    return ~nCrc;
 }
 
 
