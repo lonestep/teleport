@@ -10,8 +10,21 @@ for i in 1 2 3 4; do
     LPIDS="$LPIDS $!"
 done
 
-# Wait for receivers to open channel and register subscriptions
-sleep 2
+# Wait for all receivers to open channel and register subscriptions
+echo "[WAIT] Waiting for all 4 Receiver processes to be ready..."
+TIMEOUT=100
+for i in 1 2 3 4; do
+    COUNT=0
+    while ! grep -q "ready on topic" "$LOG_DIR/receiver_$i.log" 2>/dev/null; do
+        sleep 0.05
+        COUNT=$((COUNT + 1))
+        if [ $COUNT -ge $TIMEOUT ]; then
+            echo "[ERROR] Timeout waiting for Receiver $i to initialize!"
+            exit 1
+        fi
+    done
+done
+echo "[READY] All 4 Receiver processes are fully initialized."
 
 echo "[START] Starting 12 Sender processes (20,000,000 total messages)..."
 SPIDS=""

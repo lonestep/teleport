@@ -361,13 +361,10 @@ def main():
         print("\n--- Teleport / Wine RSS Memory Curve (MB) Over Time ---")
         print(render_ascii_chart(proc_rss, width=60, height=8, unit="M"))
 
-        print("\n--- Total System Memory Used (MB) Over Time ---")
-        print(render_ascii_chart(sys_mem, width=60, height=8, unit="M"))
-
         # Print table
         print("\n--- Detailed Resource Progression Table ---")
-        print("| Time (s) | System CPU (%) | Equivalent Cores | Group RSS (MB) | Avg RSS (MB) | Total Mem (GB) | Procs |")
-        print("|:--------:|:--------------:|:----------------:|:--------------:|:------------:|:--------------:|:-----:|")
+        print("| Time (s) | System CPU (%) | Equivalent Cores | Group RSS (MB) | Avg RSS (MB) | Procs |")
+        print("|:--------:|:--------------:|:----------------:|:--------------:|:------------:|:-----:|")
         n = len(monitor.records)
         step = max(1, n // 12)
         indices = list(range(0, n, step))
@@ -381,8 +378,7 @@ def main():
             rss = rec["teleport_rss_mb"]
             pcount = max(1, rec["teleport_procs"])
             avg_rss = rss / pcount
-            smem = rec["mem_used_mb"] / 1024.0
-            print(f"| {t:>6.2f}s  | {scpu:>12.1f}% | {cores:>14.2f} 核 | {rss:>12.1f} MB | {avg_rss:>10.1f} MB | {smem:>12.2f} GB | {pcount:>5d} |")
+            print(f"| {t:>6.2f}s  | {scpu:>12.1f}% | {cores:>14.2f} 核 | {rss:>12.1f} MB | {avg_rss:>10.1f} MB | {pcount:>5d} |")
 
     print("\nBenchmark raw results exported to: /home/shawn/src/teleport/benchmark_results.json")
 
