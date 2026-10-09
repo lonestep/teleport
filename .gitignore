@@ -32,6 +32,9 @@ CMakeSettings.json
 *.exe
 *.out
 *.app
+teleport
+teleport_linux
+teleport.exe
 
 # Logs
 TlpLog/
