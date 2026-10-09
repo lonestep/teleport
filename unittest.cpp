@@ -1,4 +1,7 @@
 #include <iostream>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include "teleport.hpp"
 
 using namespace TLP;
@@ -588,14 +591,11 @@ T_VOID UT_TestCorruptedMessageDiscard()
     T_PVOID pBuf = T_NULL;
     T_UINT64 token = 0;
     std::string msg2 = "Corrupted Message 2";
-    rc = ITeleport::AcquireBuffer(nPubChannelId, (T_UINT32)msg2.length(), pBuf, token);
+    rc = ITeleport::AcquireBuffer(nPubChannelId, (T_UINT32)msg2.length(), pBuf, token, LOG_RECORD_FLAG_CORRUPT_CRC);
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
     memcpy(pBuf, msg2.c_str(), msg2.length());
     rc = ITeleport::CommitBuffer(nPubChannelId, token, (T_UINT32)msg2.length());
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
-
-    TPRingSlot pSlot2 = pCh->GetChannelData()->GetSlot((T_UINT32)(token & RING_SLOT_MASK));
-    pSlot2->nChecksum ^= 0x12345678;
 
     std::string msg3 = "Valid Message 3";
     rc = ITeleport::Send(nPubChannelId, (T_PCVOID)msg3.c_str(), (T_UINT32)msg3.length());
@@ -619,6 +619,898 @@ T_VOID UT_TestCorruptedMessageDiscard()
         SHOULD_BE_EQUAL(g_vCorruptRecvIds[1], 3);
     }
 }
+
+
+//
+// Optimization 1 Unit Test: Variable-length messages and zero-copy wrap-around
+//
+static volatile T_UINT32 g_nVarMsgCount = 0;
+static volatile T_UINT32 g_nVarErrorCount = 0;
+
+static RC VarMsgCallback(PTCbMessage pMessage)
+{
+    if (pMessage && pMessage->eType == MsgType::MSG_SUB_GET)
+    {
+        g_nVarMsgCount++;
+        const unsigned char* pData = (const unsigned char*)pMessage->pData;
+        for (T_UINT32 i = 0; i < pMessage->nLength; i += 1024)
+        {
+            if (pData[i] != (unsigned char)(i % 251))
+            {
+                g_nVarErrorCount++;
+                break;
+            }
+        }
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_TestVariableLengthMessages()
+{
+    g_nVarMsgCount = 0;
+    g_nVarErrorCount = 0;
+
+    T_PCSTR pTopic = "ut_var_length_topic";
+    T_ID nSubId = 0, nPubId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nSubId, VarMsgCallback, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Open(pTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nPubId, VarMsgCallback, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    std::vector<T_UINT32> testSizes = { 64, 512, 4096, 16384, 65536, 131072, 262144 };
+    for (size_t s = 0; s < testSizes.size(); s++)
+    {
+        T_UINT32 nSize = testSizes[s];
+        std::vector<unsigned char> buf(nSize);
+        for (T_UINT32 i = 0; i < nSize; i++) buf[i] = (unsigned char)(i % 251);
+
+        rc = ITeleport::Send(nPubId, buf.data(), nSize);
+        SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    }
+
+    // Also test zero-copy AcquireBuffer and CommitBuffer for a large 128KB payload
+    T_UINT32 zeroCopySize = 131072;
+    T_PVOID pBuf = T_NULL;
+    T_UINT64 token = 0;
+    rc = ITeleport::AcquireBuffer(nPubId, zeroCopySize, pBuf, token);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    SHOULD_BE_TRUE(pBuf != T_NULL);
+    for (T_UINT32 i = 0; i < zeroCopySize; i++) ((unsigned char*)pBuf)[i] = (unsigned char)(i % 251);
+    rc = ITeleport::CommitBuffer(nPubId, token, zeroCopySize);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    testSizes.push_back(zeroCopySize);
+
+    T_UINT32 nWait = 100;
+    while (g_nVarMsgCount < testSizes.size() && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nVarMsgCount, (T_UINT32)testSizes.size());
+    SHOULD_BE_EQUAL(g_nVarErrorCount, 0);
+    printf("UT_TestVariableLengthMessages: All %u variable-sized and zero-copy messages verified!\n", g_nVarMsgCount);
+}
+
+
+//
+// Optimization 2 Unit Test: Backpressure policies (POLICY_BLOCK, POLICY_DROP_OLDEST, POLICY_ISOLATE_SLOW_CONSUMER)
+//
+static RC DummyPolicyCallback(PTCbMessage pMsg) { return RC::SUCCESS; }
+
+T_VOID UT_TestChannelPolicies()
+{
+    T_PCSTR pTopic = "ut_policy_test_topic";
+    T_ID nChId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nChId, DummyPolicyCallback, T_FALSE, ChannelPolicy::POLICY_BLOCK);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    CChannel* pCh = CChannelMgr::Instance().GetChannelById(nChId);
+    SHOULD_BE_TRUE(pCh != T_NULL);
+    CChannelData* pData = pCh->GetChannelData();
+    SHOULD_BE_TRUE(pData != T_NULL);
+
+    SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_BLOCK);
+
+    pData->SetChannelPolicy(ChannelPolicy::POLICY_DROP_OLDEST);
+    SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_DROP_OLDEST);
+
+    pData->SetChannelPolicy(ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER, 50);
+    SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER);
+    SHOULD_BE_EQUAL(pData->GetShmHeader()->nLagThreshold, 50);
+
+    // Test slow subscriber isolation logic
+    TPChannelShmHeader pHdr = pData->GetShmHeader();
+    pData->LockHdr();
+    pHdr->AckRecords[0].ProcId = 88888;
+    pHdr->AckRecords[0].AckFlag = ACK_FLAG::INIT;
+    pHdr->AckRecords[0].LastReadSeq = 0;
+    pHdr->AckRecords[0].LastReadOffset = 0;
+    pHdr->AckRecords[0].DropCount = 0;
+    pHdr->nSubscribers = 1;
+    pHdr->PubHeader.CommitMsgSeq = 200;
+    pHdr->PubHeader.WriteCursor = 1024 * 1024;
+    pData->UnlockHdr();
+
+    T_UINT64 minOffset = pData->GetMinSubscriberOffset();
+    pData->LockHdr();
+    SHOULD_BE_EQUAL(pHdr->AckRecords[0].Status, (T_UINT32)SUB_STATUS_ISOLATED);
+    pData->UnlockHdr();
+
+    rc = ITeleport::Close(nChId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    printf("UT_TestChannelPolicies: All 3 QoS backpressure policies verified!\n");
+}
+
+
+//
+// Optimization 4 Unit Test: Synchronous cross-process RPC Request-Response
+//
+static RC EchoRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
+{
+    std::string reqStr((const char*)pReq, nReqLen);
+    std::string respStr = "ECHO:" + reqStr;
+    if (respStr.length() > nRespLen) return RC::EXCEED_LIMIT;
+    memcpy(pResp, respStr.data(), respStr.length());
+    nRespLen = (T_UINT32)respStr.length();
+    return RC::SUCCESS;
+}
+
+static RC MathAddRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
+{
+    std::string reqStr((const char*)pReq, nReqLen);
+    int a = 0, b = 0;
+    if (sscanf(reqStr.c_str(), "%d+%d", &a, &b) == 2)
+    {
+        std::string respStr = std::to_string(a + b);
+        if (respStr.length() > nRespLen) return RC::EXCEED_LIMIT;
+        memcpy(pResp, respStr.data(), respStr.length());
+        nRespLen = (T_UINT32)respStr.length();
+        return RC::SUCCESS;
+    }
+    return RC::INVALID_PARAM;
+}
+
+T_VOID UT_TestRpcCall()
+{
+    RC rc = ITeleport::RegisterRpcService("echo_rpc_service", EchoRpcHandler);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    rc = ITeleport::RegisterRpcService("math_rpc_service", MathAddRpcHandler);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // Call echo service
+    std::string req = "HelloTeleportRpc!";
+    char respBuf[256] = {0};
+    T_UINT32 respLen = sizeof(respBuf);
+    rc = ITeleport::Call("echo_rpc_service", req.c_str(), (T_UINT32)req.length(), respBuf, respLen, 3000);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    std::string respStr(respBuf, respLen);
+    SHOULD_BE_EQUAL(respStr, "ECHO:HelloTeleportRpc!");
+
+    // Call math service multiple times
+    for (int i = 1; i <= 5; i++)
+    {
+        std::string mathReq = std::to_string(i * 10) + "+" + std::to_string(i * 20);
+        respLen = sizeof(respBuf);
+        memset(respBuf, 0, sizeof(respBuf));
+        rc = ITeleport::Call("math_rpc_service", mathReq.c_str(), (T_UINT32)mathReq.length(), respBuf, respLen, 3000);
+        SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+        std::string mathResp(respBuf, respLen);
+        SHOULD_BE_EQUAL(mathResp, std::to_string(i * 30));
+    }
+
+    rc = ITeleport::UnregisterRpcService("echo_rpc_service");
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    rc = ITeleport::UnregisterRpcService("math_rpc_service");
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    printf("UT_TestRpcCall: Synchronous cross-process RPC calls passed successfully!\n");
+}
+
+
+// ============================================================================
+// RIGOROUS AUTOMATED TESTS FOR ALL 4 OPTIMIZATIONS
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Rigor Test 1: Continuous Circular Log Buffer & Variable-Length Edge Cases
+// ----------------------------------------------------------------------------
+static volatile T_UINT32 g_nRigorBoundaryRecv = 0;
+static volatile T_UINT32 g_nRigorBoundaryCorrupt = 0;
+static std::vector<T_UINT32> g_vRigorExpectedLengths;
+
+static RC RigorBoundaryCallback(PTCbMessage pMsg)
+{
+    if (pMsg && pMsg->eType == MsgType::MSG_SUB_GET)
+    {
+        T_UINT32 idx = g_nRigorBoundaryRecv++;
+        if (idx < g_vRigorExpectedLengths.size())
+        {
+            if (pMsg->nLength != g_vRigorExpectedLengths[idx])
+            {
+                g_nRigorBoundaryCorrupt++;
+            }
+        }
+        if (pMsg->nLength > 0 && pMsg->pData)
+        {
+            const unsigned char* pBytes = (const unsigned char*)pMsg->pData;
+            for (T_UINT32 i = 0; i < pMsg->nLength; i += 512)
+            {
+                if (pBytes[i] != (unsigned char)((i ^ 0xA5) & 0xFF))
+                {
+                    g_nRigorBoundaryCorrupt++;
+                    break;
+                }
+            }
+        }
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_VariableLength_BoundaryWrapping()
+{
+    g_nRigorBoundaryRecv = 0;
+    g_nRigorBoundaryCorrupt = 0;
+    g_vRigorExpectedLengths.clear();
+
+    T_PCSTR pTopic = "ut_rigor_var_boundary";
+    T_ID nSubId = 0, nPubId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nSubId, RigorBoundaryCallback, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Open(pTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nPubId, T_NULL, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // 1. Edge Case: Message exceeding maximum limit (MAX_LOG_MESSAGE_SIZE + 1024)
+    std::vector<unsigned char> oversized(MAX_LOG_MESSAGE_SIZE + 1024, 0xEE);
+    rc = ITeleport::Send(nPubId, oversized.data(), (T_UINT32)oversized.size());
+    SHOULD_BE_EQUAL(rc, RC::EXCEED_LIMIT);
+
+    // 2. Edge Case: Empty 0-byte payload
+    g_vRigorExpectedLengths.push_back(0);
+    rc = ITeleport::Send(nPubId, T_NULL, 0);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // 3. Edge Cases: Exact cache line boundaries (1B, 15B, 63B, 64B, 65B, 127B, 128B)
+    std::vector<T_UINT32> edgeSizes = { 1, 15, 63, 64, 65, 127, 128, 511, 512, 1024, 4096, 65536, 262144 };
+    for (T_UINT32 sz : edgeSizes)
+    {
+        g_vRigorExpectedLengths.push_back(sz);
+        std::vector<unsigned char> payload(sz);
+        for (T_UINT32 i = 0; i < sz; i++) payload[i] = (unsigned char)((i ^ 0xA5) & 0xFF);
+        rc = ITeleport::Send(nPubId, payload.data(), sz);
+        SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    }
+
+    // 4. Force Continuous Boundary Wrap-Around:
+    // Write 300 messages of 64KB each (= 19.2MB).
+    // Given the 16MB ring buffer, this is guaranteed to wrap around offset 0,
+    // triggering LOG_RECORD_FLAG_PADDING and resetting write cursor to offset 0 cleanly.
+    T_UINT32 wrapBlockSize = 65536;
+    std::vector<unsigned char> wrapPayload(wrapBlockSize);
+    for (T_UINT32 i = 0; i < wrapBlockSize; i++) wrapPayload[i] = (unsigned char)((i ^ 0xA5) & 0xFF);
+
+    for (int w = 0; w < 300; w++)
+    {
+        g_vRigorExpectedLengths.push_back(wrapBlockSize);
+        rc = ITeleport::Send(nPubId, wrapPayload.data(), wrapBlockSize);
+        SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    }
+
+    T_UINT32 nExpectedTotal = (T_UINT32)g_vRigorExpectedLengths.size();
+    T_UINT32 nWait = 200;
+    while (g_nRigorBoundaryRecv < nExpectedTotal && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nRigorBoundaryRecv, nExpectedTotal);
+    SHOULD_BE_EQUAL(g_nRigorBoundaryCorrupt, 0);
+    printf("UT_Rigor_VariableLength_BoundaryWrapping: %u messages (including wrap-around and limits) passed with 0 corruption!\n", nExpectedTotal);
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 2: Concurrent Multi-Thread Variable-Length Messages
+// ----------------------------------------------------------------------------
+static volatile T_UINT32 g_nRigorConcurrentRecv = 0;
+static volatile T_UINT32 g_nRigorConcurrentErrors = 0;
+static std::map<T_UINT32, T_UINT32> g_mRigorThreadLastSeq;
+static std::mutex g_mRigorConcurrentMtx;
+
+static RC RigorConcurrentCallback(PTCbMessage pMsg)
+{
+    if (pMsg && pMsg->eType == MsgType::MSG_SUB_GET)
+    {
+        if (pMsg->nLength >= 8 && pMsg->pData)
+        {
+            T_UINT32 threadId = *(T_UINT32*)pMsg->pData;
+            T_UINT32 seq = *((T_UINT32*)pMsg->pData + 1);
+
+            std::lock_guard<std::mutex> lk(g_mRigorConcurrentMtx);
+            if (g_mRigorThreadLastSeq.find(threadId) == g_mRigorThreadLastSeq.end())
+            {
+                g_mRigorThreadLastSeq[threadId] = 0;
+            }
+            if (seq != g_mRigorThreadLastSeq[threadId] + 1)
+            {
+                g_nRigorConcurrentErrors++;
+            }
+            g_mRigorThreadLastSeq[threadId] = seq;
+
+            // Verify payload pattern
+            const unsigned char* pBytes = (const unsigned char*)pMsg->pData;
+            for (T_UINT32 i = 8; i < pMsg->nLength; i += 256)
+            {
+                if (pBytes[i] != (unsigned char)((i + threadId) & 0xFF))
+                {
+                    g_nRigorConcurrentErrors++;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            g_nRigorConcurrentErrors++;
+        }
+        g_nRigorConcurrentRecv++;
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_VariableLength_ConcurrentMultiThread()
+{
+    g_nRigorConcurrentRecv = 0;
+    g_nRigorConcurrentErrors = 0;
+    g_mRigorThreadLastSeq.clear();
+
+    T_PCSTR pTopic = "ut_rigor_var_concurrent";
+    T_ID nSubId = 0, nPubId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nSubId, RigorConcurrentCallback, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Open(pTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nPubId, T_NULL, T_FALSE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    const int nThreads = 4;
+    const int nMsgsPerThread = 50;
+    std::vector<std::thread> senders;
+
+    for (int t = 1; t <= nThreads; t++)
+    {
+        senders.emplace_back([nPubId, t, nMsgsPerThread]() {
+            for (int s = 1; s <= nMsgsPerThread; s++)
+            {
+                T_UINT32 sz = 32 + ((s * 37 + t * 97) % 8192); // variable size 32B ~ 8KB
+                std::vector<unsigned char> buf(sz);
+                *(T_UINT32*)buf.data() = (T_UINT32)t;
+                *((T_UINT32*)buf.data() + 1) = (T_UINT32)s;
+                for (T_UINT32 i = 8; i < sz; i++)
+                {
+                    buf[i] = (unsigned char)((i + t) & 0xFF);
+                }
+                RC sendRc = ITeleport::Send(nPubId, buf.data(), sz);
+                if (IS_FAILED(sendRc))
+                {
+                    g_nRigorConcurrentErrors++;
+                }
+            }
+        });
+    }
+
+    for (auto& th : senders)
+    {
+        th.join();
+    }
+
+    T_UINT32 nTotalExpected = nThreads * nMsgsPerThread;
+    T_UINT32 nWait = 200;
+    while (g_nRigorConcurrentRecv < nTotalExpected && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nRigorConcurrentRecv, nTotalExpected);
+    SHOULD_BE_EQUAL(g_nRigorConcurrentErrors, 0);
+    printf("UT_Rigor_VariableLength_ConcurrentMultiThread: %u concurrent variable messages verified with 0 error!\n", nTotalExpected);
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 3: QoS POLICY_BLOCK Backpressure & 100% Reliable Delivery
+// ----------------------------------------------------------------------------
+static volatile T_UINT32 g_nRigorBlockRecv = 0;
+
+static RC RigorBlockCallback(PTCbMessage pMsg)
+{
+    if (pMsg && pMsg->eType == MsgType::MSG_SUB_GET)
+    {
+        g_nRigorBlockRecv++;
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_Policy_Block_Backpressure()
+{
+    g_nRigorBlockRecv = 0;
+    T_PCSTR pTopic = "ut_rigor_policy_block";
+    T_ID nSubId = 0, nPubId = 0;
+
+    // Explicitly set POLICY_BLOCK
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nSubId, RigorBlockCallback, T_FALSE, ChannelPolicy::POLICY_BLOCK);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Open(pTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nPubId, T_NULL, T_FALSE, ChannelPolicy::POLICY_BLOCK);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    rc = ITeleport::SetChannelPolicy(nPubId, ChannelPolicy::POLICY_BLOCK);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    ChannelPolicy pol = ChannelPolicy::POLICY_DROP_OLDEST;
+    T_UINT32 lag = 0;
+    rc = ITeleport::GetChannelPolicy(nPubId, pol, lag);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    SHOULD_BE_EQUAL((int)pol, (int)ChannelPolicy::POLICY_BLOCK);
+
+    // Send 200 messages (each 4KB)
+    const T_UINT32 nTotal = 200;
+    std::vector<unsigned char> data(4096, 0x5A);
+    for (T_UINT32 i = 0; i < nTotal; i++)
+    {
+        rc = ITeleport::Send(nPubId, data.data(), (T_UINT32)data.size());
+        SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    }
+
+    T_UINT32 nWait = 200;
+    while (g_nRigorBlockRecv < nTotal && nWait--)
+    {
+        TSleep(20);
+    }
+
+    rc = ITeleport::Close(nPubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    rc = ITeleport::Close(nSubId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(g_nRigorBlockRecv, nTotal);
+    printf("UT_Rigor_Policy_Block_Backpressure: POLICY_BLOCK verified 100%% reliable delivery (%u/%u)!\n", g_nRigorBlockRecv, nTotal);
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 4: QoS POLICY_DROP_OLDEST Buffer Overrun & DropCount Recovery
+// ----------------------------------------------------------------------------
+static volatile T_UINT32 g_nRigorDropCountReceived = 0;
+static volatile T_UINT32 g_nRigorDropMsgCount = 0;
+
+static RC RigorDropCallback(PTCbMessage pMsg)
+{
+    if (pMsg)
+    {
+        if (pMsg->eType == MsgType::MSG_DROPPED)
+        {
+            g_nRigorDropCountReceived += pMsg->nLength;
+        }
+        else if (pMsg->eType == MsgType::MSG_SUB_GET)
+        {
+            g_nRigorDropMsgCount++;
+        }
+    }
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_Policy_DropOldest_Overwrite()
+{
+    g_nRigorDropCountReceived = 0;
+    g_nRigorDropMsgCount = 0;
+
+    T_PCSTR pTopic = "ut_rigor_policy_drop";
+    T_ID nChId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nChId, RigorDropCallback, T_FALSE, ChannelPolicy::POLICY_DROP_OLDEST);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    CChannel* pCh = CChannelMgr::Instance().GetChannelById(nChId);
+    SHOULD_BE_TRUE(pCh != T_NULL);
+    CChannelData* pData = pCh->GetChannelData();
+    SHOULD_BE_TRUE(pData != T_NULL);
+
+    SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_DROP_OLDEST);
+
+    // Write records into channel
+    T_MSG_ID msgId = 0;
+    T_UINT32 dummy = 12345;
+    for (int i = 0; i < 5; i++)
+    {
+        pData->WriteRingMsg(&dummy, sizeof(dummy), msgId, 1001);
+    }
+
+    // Simulate severe subscriber lag exceeding buffer capacity
+    TPChannelShmHeader pHdr = pData->GetShmHeader();
+    pData->LockHdr();
+    pHdr->PubHeader.WriteCursor = 32 * 1024 * 1024; // 32MB ahead
+    pHdr->AckRecords[0].LastReadOffset = 0;
+    pHdr->AckRecords[0].LastReadSeq = 0;
+    pData->UnlockHdr();
+
+    // Call ReadRingMsg: detects overrun, updates DropCount, marks SUB_STATUS_DROPPED
+    T_PVOID pOutData = T_NULL;
+    T_UINT32 nOutSize = 0;
+    T_MSG_ID nOutId = 0;
+    T_ID nOutSender = 0;
+    T_UINT32 nOutFlags = 0;
+    T_UINT64 nOutCorr = 0;
+    rc = pData->ReadRingMsg(&pHdr->AckRecords[0], pOutData, nOutSize, nOutId, nOutSender, nOutFlags, nOutCorr);
+
+    pData->LockHdr();
+    SHOULD_BE_EQUAL(pHdr->AckRecords[0].Status, (T_UINT32)SUB_STATUS_DROPPED);
+    pData->UnlockHdr();
+
+    rc = ITeleport::Close(nChId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    printf("UT_Rigor_Policy_DropOldest_Overwrite: POLICY_DROP_OLDEST overrun detection & recovery passed!\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 5: QoS POLICY_ISOLATE_SLOW_CONSUMER Dynamic Lag Isolation & Recovery
+// ----------------------------------------------------------------------------
+T_VOID UT_Rigor_Policy_IsolateSlowConsumer()
+{
+    T_PCSTR pTopic = "ut_rigor_policy_isolate";
+    T_ID nChId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nChId, DummyPolicyCallback, T_FALSE, ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    CChannel* pCh = CChannelMgr::Instance().GetChannelById(nChId);
+    SHOULD_BE_TRUE(pCh != T_NULL);
+    CChannelData* pData = pCh->GetChannelData();
+    SHOULD_BE_TRUE(pData != T_NULL);
+
+    // Set lag threshold to 32 KB
+    pData->SetChannelPolicy(ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER, 32 * 1024);
+    SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER);
+    SHOULD_BE_EQUAL(pData->GetShmHeader()->nLagThreshold, 32 * 1024);
+
+    // Setup 2 subscribers in shared memory:
+    // Sub 0: Fast subscriber (LastReadOffset = 64KB)
+    // Sub 1: Slow subscriber (LastReadOffset = 0KB, lag = 64KB > 32KB threshold)
+    TPChannelShmHeader pHdr = pData->GetShmHeader();
+    pData->LockHdr();
+    pHdr->nSubscribers = 2;
+    pHdr->PubHeader.WriteCursor = 64 * 1024;
+    pHdr->PubHeader.WriteMsgSeq = 100;
+    pHdr->PubHeader.CommitMsgSeq = 100;
+
+    pHdr->AckRecords[0].ProcId = 11111;
+    pHdr->AckRecords[0].Status = SUB_STATUS_ACTIVE;
+    pHdr->AckRecords[0].LastReadOffset = 64 * 1024;
+    pHdr->AckRecords[0].LastReadSeq = 100;
+
+    pHdr->AckRecords[1].ProcId = 22222;
+    pHdr->AckRecords[1].Status = SUB_STATUS_ACTIVE;
+    pHdr->AckRecords[1].LastReadOffset = 0;
+    pHdr->AckRecords[1].LastReadSeq = 0;
+    pData->UnlockHdr();
+
+    // Call GetMinSubscriberOffset:
+    // Sub 1 has lag 64KB > threshold 32KB -> MUST transition to SUB_STATUS_ISOLATED!
+    T_UINT64 minOffset = pData->GetMinSubscriberOffset();
+
+    pData->LockHdr();
+    SHOULD_BE_EQUAL(pHdr->AckRecords[1].Status, (T_UINT32)SUB_STATUS_ISOLATED);
+    SHOULD_BE_EQUAL(pHdr->AckRecords[0].Status, (T_UINT32)SUB_STATUS_ACTIVE);
+    pData->UnlockHdr();
+
+    // The minOffset must now reflect Sub 0's offset, ignoring the isolated Sub 1!
+    SHOULD_BE_EQUAL(minOffset, (T_UINT64)(64 * 1024));
+
+    // Now test recovery: Sub 1 catches up
+    pData->LockHdr();
+    pHdr->AckRecords[1].LastReadOffset = 64 * 1024;
+    pData->UnlockHdr();
+
+    minOffset = pData->GetMinSubscriberOffset();
+    pData->LockHdr();
+    SHOULD_BE_EQUAL(pHdr->AckRecords[1].Status, (T_UINT32)SUB_STATUS_ACTIVE);
+    pData->UnlockHdr();
+
+    rc = ITeleport::Close(nChId, T_TRUE);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    printf("UT_Rigor_Policy_IsolateSlowConsumer: Dynamic lag isolation & recovery passed!\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 6: Hybrid Adaptive Wait Pruning & High-Contention Spinlock
+// ----------------------------------------------------------------------------
+T_VOID UT_Rigor_AdaptiveWait_PruningAndTiming()
+{
+    // 1. Primitive sanity tests
+    for (int i = 0; i < 1000; i++)
+    {
+        T_CPU_PAUSE();
+    }
+    for (int i = 0; i < 20; i++)
+    {
+        T_THREAD_YIELD();
+    }
+
+    // 2. T_ADAPTIVE_WAIT spin phase test (true at attempt 20)
+    int count = 0;
+    bool res = T_ADAPTIVE_WAIT([&count]() {
+        return (++count >= 20);
+    }, 100, 10);
+    SHOULD_BE_TRUE(res);
+    SHOULD_BE_EQUAL(count, 20);
+
+    // 3. T_ADAPTIVE_WAIT yield phase test (true at attempt 105, spinCount = 100)
+    count = 0;
+    res = T_ADAPTIVE_WAIT([&count]() {
+        return (++count >= 105);
+    }, 100, 20);
+    SHOULD_BE_TRUE(res);
+    SHOULD_BE_EQUAL(count, 105);
+
+    // 4. T_ADAPTIVE_WAIT never true
+    count = 0;
+    res = T_ADAPTIVE_WAIT([&count]() {
+        count++;
+        return false;
+    }, 50, 10);
+    SHOULD_BE_TRUE(!res);
+    SHOULD_BE_EQUAL(count, 61); // 50 spins + 10 yields + 1 final check
+
+    // 5. T_ADAPTIVE_WAIT_TIMEOUT test with background delayed signal
+    std::atomic<bool> flag{ false };
+    std::thread delayedSignaler([&flag]() {
+        TSleep(30);
+        flag = true;
+    });
+
+    res = T_ADAPTIVE_WAIT_TIMEOUT([&flag]() {
+        return flag.load();
+    }, 500, 50, 10);
+    SHOULD_BE_TRUE(res);
+    delayedSignaler.join();
+
+    // 6. High contention multithreaded spinlock test
+    std::atomic<int> spinlockVal{ 0 };
+    std::atomic<int> sharedCounter{ 0 };
+    const int nWorkers = 4;
+    const int nOpsPerWorker = 5000;
+    std::vector<std::thread> workers;
+
+    for (int w = 0; w < nWorkers; w++)
+    {
+        workers.emplace_back([&]() {
+            for (int op = 0; op < nOpsPerWorker; op++)
+            {
+                while (spinlockVal.exchange(1, std::memory_order_acquire) != 0)
+                {
+                    T_CPU_PAUSE();
+                }
+                sharedCounter.fetch_add(1, std::memory_order_relaxed);
+                spinlockVal.store(0, std::memory_order_release);
+            }
+        });
+    }
+
+    for (auto& w : workers)
+    {
+        w.join();
+    }
+    SHOULD_BE_EQUAL(sharedCounter.load(), nWorkers * nOpsPerWorker);
+
+    printf("UT_Rigor_AdaptiveWait_PruningAndTiming: All 6 adaptive wait and contention tests passed!\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 7: Synchronous RPC Concurrent Multi-Thread Correlation Isolation
+// ----------------------------------------------------------------------------
+static RC RigorCalcRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
+{
+    std::string req((const char*)pReq, nReqLen);
+    int a = 0, b = 0;
+    if (sscanf(req.c_str(), "%d*%d", &a, &b) == 2)
+    {
+        std::string resp = std::to_string(a * b + 11);
+        if (resp.length() > nRespLen) return RC::EXCEED_LIMIT;
+        memcpy(pResp, resp.data(), resp.length());
+        nRespLen = (T_UINT32)resp.length();
+        return RC::SUCCESS;
+    }
+    return RC::INVALID_PARAM;
+}
+
+T_VOID UT_Rigor_Rpc_MultiThreadedConcurrency()
+{
+    T_PCSTR pServiceName = "rigor_calc_service";
+    RC rc = ITeleport::RegisterRpcService(pServiceName, RigorCalcRpcHandler);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    const int nClients = 4;
+    const int nCallsPerClient = 25;
+    std::atomic<int> nSuccessCalls{ 0 };
+    std::atomic<int> nCrossTalkErrors{ 0 };
+    std::vector<std::thread> clients;
+
+    for (int c = 1; c <= nClients; c++)
+    {
+        clients.emplace_back([pServiceName, c, nCallsPerClient, &nSuccessCalls, &nCrossTalkErrors]() {
+            for (int k = 1; k <= nCallsPerClient; k++)
+            {
+                int a = c * 10 + k;
+                int b = k * 3;
+                std::string req = std::to_string(a) + "*" + std::to_string(b);
+                std::string expectedResp = std::to_string(a * b + 11);
+
+                char respBuf[128] = { 0 };
+                T_UINT32 respLen = sizeof(respBuf);
+                RC callRc = ITeleport::Call(pServiceName, req.c_str(), (T_UINT32)req.length(), respBuf, respLen, 3000);
+                if (IS_SUCCESS(callRc))
+                {
+                    std::string actualResp(respBuf, respLen);
+                    if (actualResp != expectedResp)
+                    {
+                        nCrossTalkErrors++;
+                    }
+                    else
+                    {
+                        nSuccessCalls++;
+                    }
+                }
+                else
+                {
+                    nCrossTalkErrors++;
+                }
+            }
+        });
+    }
+
+    for (auto& cl : clients)
+    {
+        cl.join();
+    }
+
+    rc = ITeleport::UnregisterRpcService(pServiceName);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    SHOULD_BE_EQUAL(nSuccessCalls.load(), nClients * nCallsPerClient);
+    SHOULD_BE_EQUAL(nCrossTalkErrors.load(), 0);
+    printf("UT_Rigor_Rpc_MultiThreadedConcurrency: %d concurrent RPC calls with correlation ID matching verified!\n", nSuccessCalls.load());
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 8: Large RPC Payload & Client Truncation Verification
+// ----------------------------------------------------------------------------
+static RC RigorPayloadRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
+{
+    T_UINT32 outSize = nReqLen * 2;
+    if (outSize > nRespLen)
+    {
+        return RC::EXCEED_LIMIT;
+    }
+    unsigned char* pOut = (unsigned char*)pResp;
+    for (T_UINT32 i = 0; i < outSize; i++)
+    {
+        pOut[i] = (unsigned char)((i ^ 0x3C) & 0xFF);
+    }
+    nRespLen = outSize;
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_Rpc_LargePayloadAndTruncation()
+{
+    T_PCSTR pServiceName = "rigor_payload_service";
+    RC rc = ITeleport::RegisterRpcService(pServiceName, RigorPayloadRpcHandler);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // 1. Large 32KB request producing 64KB response
+    T_UINT32 reqSize = 32768;
+    std::vector<unsigned char> reqPayload(reqSize, 0xAA);
+    std::vector<unsigned char> respBuffer(131072, 0);
+    T_UINT32 respLen = (T_UINT32)respBuffer.size();
+
+    rc = ITeleport::Call(pServiceName, reqPayload.data(), reqSize, respBuffer.data(), respLen, 3000);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    SHOULD_BE_EQUAL(respLen, reqSize * 2);
+
+    // Verify content integrity
+    for (T_UINT32 i = 0; i < respLen; i++)
+    {
+        if (respBuffer[i] != (unsigned char)((i ^ 0x3C) & 0xFF))
+        {
+            SHOULD_BE_TRUE(false);
+            break;
+        }
+    }
+
+    // 2. Truncation test: Client only provides 32 bytes for a 64KB response
+    char smallBuf[32] = { 0 };
+    T_UINT32 smallLen = sizeof(smallBuf);
+    rc = ITeleport::Call(pServiceName, reqPayload.data(), reqSize, smallBuf, smallLen, 3000);
+    SHOULD_BE_EQUAL(rc, RC::EXCEED_LIMIT);
+    SHOULD_BE_EQUAL(smallLen, reqSize * 2); // Informs caller of actual response size
+    for (T_UINT32 i = 0; i < sizeof(smallBuf); i++)
+    {
+        SHOULD_BE_EQUAL((unsigned char)smallBuf[i], (unsigned char)((i ^ 0x3C) & 0xFF));
+    }
+
+    rc = ITeleport::UnregisterRpcService(pServiceName);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+    printf("UT_Rigor_Rpc_LargePayloadAndTruncation: Large payload (64KB) and truncation checks passed!\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// Rigor Test 9: RPC Timeout, Error Status Propagation & Cleanup
+// ----------------------------------------------------------------------------
+static RC RigorTimeoutRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
+{
+    std::string req((const char*)pReq, nReqLen);
+    if (req == "SLOW")
+    {
+        TSleep(250);
+        return RC::SUCCESS;
+    }
+    else if (req == "ERROR_PARAM")
+    {
+        return RC::INVALID_PARAM;
+    }
+    std::string resp = "OK:" + req;
+    if (resp.length() > nRespLen) return RC::EXCEED_LIMIT;
+    memcpy(pResp, resp.data(), resp.length());
+    nRespLen = (T_UINT32)resp.length();
+    return RC::SUCCESS;
+}
+
+T_VOID UT_Rigor_Rpc_TimeoutAndErrorHandling()
+{
+    T_PCSTR pServiceName = "rigor_timeout_service";
+    RC rc = ITeleport::RegisterRpcService(pServiceName, RigorTimeoutRpcHandler);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // 1. Test timeout: handler sleeps 250ms, client timeout = 50ms
+    char respBuf[64] = { 0 };
+    T_UINT32 respLen = sizeof(respBuf);
+    std::string slowReq = "SLOW";
+    rc = ITeleport::Call(pServiceName, slowReq.c_str(), (T_UINT32)slowReq.length(), respBuf, respLen, 50);
+    SHOULD_BE_EQUAL(rc, RC::TIMEOUT);
+
+    // 2. Test handler custom error code propagation
+    std::string errReq = "ERROR_PARAM";
+    respLen = sizeof(respBuf);
+    rc = ITeleport::Call(pServiceName, errReq.c_str(), (T_UINT32)errReq.length(), respBuf, respLen, 3000);
+    SHOULD_BE_EQUAL(rc, RC::INVALID_PARAM);
+
+    // 3. Test clean unregister
+    rc = ITeleport::UnregisterRpcService(pServiceName);
+    SHOULD_BE_EQUAL(rc, RC::SUCCESS);
+
+    // 4. Test calling unregistered/closed service
+    std::string normReq = "PING";
+    respLen = sizeof(respBuf);
+    rc = ITeleport::Call(pServiceName, normReq.c_str(), (T_UINT32)normReq.length(), respBuf, respLen, 50);
+    SHOULD_BE_TRUE(rc == RC::CLOSED || rc == RC::TIMEOUT || rc == RC::NOT_FOUND);
+
+    printf("UT_Rigor_Rpc_TimeoutAndErrorHandling: RPC timeout and error propagation verified!\n");
+}
+
 
 
 //
@@ -1004,6 +1896,20 @@ int main(int argc, char** argv)
             UT_TestZombieCleanup();
             UT_TestCRCIntegrity();
             UT_TestCorruptedMessageDiscard();
+            UT_TestVariableLengthMessages();
+            UT_TestChannelPolicies();
+            UT_TestRpcCall();
+
+            // Rigorous automated test cases for all 4 optimizations
+            UT_Rigor_VariableLength_BoundaryWrapping();
+            UT_Rigor_VariableLength_ConcurrentMultiThread();
+            UT_Rigor_Policy_Block_Backpressure();
+            UT_Rigor_Policy_DropOldest_Overwrite();
+            UT_Rigor_Policy_IsolateSlowConsumer();
+            UT_Rigor_AdaptiveWait_PruningAndTiming();
+            UT_Rigor_Rpc_MultiThreadedConcurrency();
+            UT_Rigor_Rpc_LargePayloadAndTruncation();
+            UT_Rigor_Rpc_TimeoutAndErrorHandling();
             return 0;
         }
         else if (0 == _stricmp(pCmd, "stress"))

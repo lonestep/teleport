@@ -17,13 +17,87 @@
 #include <vector>
 #include <queue>
 #include <mutex>
+#include <condition_variable>
+#include <atomic>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <emmintrin.h>
+#endif
 #include "typedefs.hpp"
 #ifdef Windows
 #include <sddl.h>
 #include <objbase.h>
+#include <synchapi.h>
 #else
 #include <sys/time.h>
+#include <sched.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #endif
+
+// Fast CPU Pause and Thread Yield Primitives
+static inline void T_CPU_PAUSE()
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(Windows)
+    YieldProcessor();
+#else
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+static inline void T_THREAD_YIELD()
+{
+#ifdef Windows
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+// Optimization 3: Hybrid Adaptive Wait
+template<typename Predicate>
+inline bool T_ADAPTIVE_WAIT(Predicate pred, uint32_t spinCount = 300, uint32_t yieldCount = 20)
+{
+    for (uint32_t i = 0; i < spinCount; i++)
+    {
+        if (pred()) return true;
+        T_CPU_PAUSE();
+    }
+    for (uint32_t j = 0; j < yieldCount; j++)
+    {
+        if (pred()) return true;
+        T_THREAD_YIELD();
+    }
+    return pred();
+}
+
+template<typename Predicate>
+inline bool T_ADAPTIVE_WAIT_TIMEOUT(Predicate pred, uint32_t nTimeoutMs = 1000, uint32_t spinCount = 300, uint32_t yieldCount = 20)
+{
+    for (uint32_t i = 0; i < spinCount; i++)
+    {
+        if (pred()) return true;
+        T_CPU_PAUSE();
+    }
+    for (uint32_t j = 0; j < yieldCount; j++)
+    {
+        if (pred()) return true;
+        T_THREAD_YIELD();
+    }
+    uint32_t elapsed = 0;
+    while (!pred() && elapsed < nTimeoutMs)
+    {
+#ifdef Windows
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+        elapsed += 1;
+    }
+    return pred();
+}
 
 
 namespace TLP 
@@ -236,7 +310,7 @@ namespace TLP
         Logger();
         virtual ~Logger();
         Logger(const Logger&) :m_bLoggerEnable(T_TRUE), m_szBuffer{ 0 }{};
-        Logger& operator =(const Logger&) {}
+        Logger& operator =(const Logger&) { return *this; }
         CRITICAL_SECTION m_cs;
 
     };

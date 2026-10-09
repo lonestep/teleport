@@ -108,12 +108,111 @@ RC CChannelBase::SetCallBack(TLP_CALLBACK cb)
 }
 
 
+// Global RPC state management
+static std::mutex g_mRpcLock;
+static std::map<T_STRING, TLP_RPC_HANDLER> g_mRpcHandlers;
+static std::map<T_STRING, T_ID> g_mRpcServerChannels;
+
+struct RpcPendingCall
+{
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool completed = false;
+    RC status = RC::TIMEOUT;
+    std::vector<uint8_t> respData;
+};
+
+static std::mutex g_mPendingCallsLock;
+static std::map<T_UINT64, RpcPendingCall*> g_mPendingCalls;
+static std::atomic<uint64_t> g_nRpcSeqCounter{ 1 };
+
+// RPC Server callback: receives requests, invokes handler, sends response to szReplyTopic
+static RC RpcServerCallback(PTCbMessage pMsg)
+{
+    if (!pMsg || !pMsg->pData || pMsg->nLength < sizeof(TRpcEnvelope))
+    {
+        return RC::INVALID_PARAM;
+    }
+    TRpcEnvelope* pEnv = (TRpcEnvelope*)pMsg->pData;
+    TLP_RPC_HANDLER handler = T_NULL;
+    T_BOOL bGlobal = T_FALSE;
+    {
+        std::lock_guard<std::mutex> lk(g_mRpcLock);
+        CChannel* pCh = CChannelMgr::Instance().GetChannelById(pMsg->nChannelId);
+        if (pCh)
+        {
+            bGlobal = pCh->IsGlobal();
+            auto it = g_mRpcHandlers.find(pCh->GetChannelName());
+            if (it != g_mRpcHandlers.end())
+            {
+                handler = it->second;
+            }
+        }
+    }
+    if (!handler)
+    {
+        return RC::NOT_FOUND;
+    }
+
+    const void* pReqBody = (const void*)((const char*)pMsg->pData + sizeof(TRpcEnvelope));
+    T_UINT32 nReqBodyLen = pEnv->nBodyLength;
+
+    std::vector<uint8_t> respBuffer(1024 * 1024);
+    T_UINT32 nRespLen = (T_UINT32)respBuffer.size();
+
+    RC rc = handler(pReqBody, nReqBodyLen, respBuffer.data(), nRespLen);
+
+    std::vector<uint8_t> fullResp(sizeof(TRpcResponseEnvelope) + nRespLen);
+    TRpcResponseEnvelope* pRespEnv = (TRpcResponseEnvelope*)fullResp.data();
+    pRespEnv->nCorrelationId = pEnv->nCorrelationId;
+    pRespEnv->nResult = rc;
+    pRespEnv->nBodyLength = nRespLen;
+    pRespEnv->nReserved = 0;
+    if (nRespLen > 0)
+    {
+        memcpy(fullResp.data() + sizeof(TRpcResponseEnvelope), respBuffer.data(), nRespLen);
+    }
+
+    T_ID nReplyChId = 0;
+    rc = ITeleport::Open(pEnv->szReplyTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nReplyChId, T_NULL, bGlobal);
+    if (IS_SUCCESS(rc))
+    {
+        rc = ITeleport::Send(nReplyChId, fullResp.data(), (T_UINT32)fullResp.size(), LOG_RECORD_FLAG_RPC_RESP, pEnv->nCorrelationId);
+    }
+    return rc;
+}
+
+// RPC Client reply callback: receives responses, dispatches to pending caller
+static RC RpcClientReplyCallback(PTCbMessage pMsg)
+{
+    if (!pMsg || !pMsg->pData || pMsg->nLength < sizeof(TRpcResponseEnvelope))
+    {
+        return RC::INVALID_PARAM;
+    }
+    TRpcResponseEnvelope* pResp = (TRpcResponseEnvelope*)pMsg->pData;
+    std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
+    auto it = g_mPendingCalls.find(pResp->nCorrelationId);
+    if (it != g_mPendingCalls.end())
+    {
+        RpcPendingCall* pCall = it->second;
+        std::lock_guard<std::mutex> clk(pCall->mtx);
+        pCall->status = pResp->nResult;
+        const uint8_t* pBody = (const uint8_t*)pMsg->pData + sizeof(TRpcResponseEnvelope);
+        pCall->respData.assign(pBody, pBody + pResp->nBodyLength);
+        pCall->completed = true;
+        pCall->cv.notify_one();
+    }
+    return RC::SUCCESS;
+}
+
+
 //
 RC ITeleport::Open(T_PCSTR strChannelName,
     T_UINT32 eOpenFlag,
     T_ID& nChannelId,
     TLP_CALLBACK cbCallback,
-    T_BOOL bGlobal)
+    T_BOOL bGlobal,
+    ChannelPolicy ePolicy)
 {
     CChannelMgr* pChannelMgr = &CChannelMgr::Instance();
     RC rc = pChannelMgr->ValidateChannelParam(strChannelName, eOpenFlag, cbCallback);
@@ -129,14 +228,17 @@ RC ITeleport::Open(T_PCSTR strChannelName,
         {
             return RC::NOT_FOUND;
         }
-        pChannel = pChannelMgr->CreateChannel(strChannelName, bGlobal);
+        pChannel = pChannelMgr->CreateChannel(strChannelName, bGlobal, ePolicy);
         if (!pChannel)
         {
             return RC::FAILED;
         }
     }
     nChannelId = pChannel->GetChannelId();
-    pChannel->SetCallBack(cbCallback);
+    if (cbCallback)
+    {
+        pChannel->SetCallBack(cbCallback);
+    }
     if ( ((T_USHORT)eOpenFlag & CH_LISTEN)&&
         !pChannel->IsOpenned() )
     {
@@ -147,28 +249,28 @@ RC ITeleport::Open(T_PCSTR strChannelName,
 
 
 //
-RC ITeleport::Send(T_ID nChannelId, T_PCVOID pData, T_UINT32 nSizeInByte)
+RC ITeleport::Send(T_ID nChannelId, T_PCVOID pData, T_UINT32 nSizeInByte, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
-    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    if (nSizeInByte > MAX_LOG_MESSAGE_SIZE)
     {
         return RC::EXCEED_LIMIT;
     }
     CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
     if (pChannel)
     {
-        return pChannel->Publish(pData, nSizeInByte);
+        return pChannel->Publish(pData, nSizeInByte, nFlags, nCorrelationId);
     }
     return RC::NOT_FOUND;
 }
 
 
 //
-RC ITeleport::AcquireBuffer(T_ID nChannelId, T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+RC ITeleport::AcquireBuffer(T_ID nChannelId, T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
     CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
     if (pChannel)
     {
-        return pChannel->AcquireBuffer(nSizeInByte, pBuffer, nToken);
+        return pChannel->AcquireBuffer(nSizeInByte, pBuffer, nToken, nFlags, nCorrelationId);
     }
     return RC::NOT_FOUND;
 }
@@ -181,6 +283,33 @@ RC ITeleport::CommitBuffer(T_ID nChannelId, T_UINT64 nToken, T_UINT32 nSizeInByt
     if (pChannel)
     {
         return pChannel->CommitBuffer(nToken, nSizeInByte);
+    }
+    return RC::NOT_FOUND;
+}
+
+
+//
+RC ITeleport::SetChannelPolicy(T_ID nChannelId, ChannelPolicy ePolicy, T_UINT32 nLagThreshold)
+{
+    CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
+    if (pChannel && pChannel->GetChannelData())
+    {
+        pChannel->GetChannelData()->SetChannelPolicy(ePolicy, nLagThreshold);
+        return RC::SUCCESS;
+    }
+    return RC::NOT_FOUND;
+}
+
+
+//
+RC ITeleport::GetChannelPolicy(T_ID nChannelId, ChannelPolicy& ePolicy, T_UINT32& nLagThreshold)
+{
+    CChannel* pChannel = CChannelMgr::Instance().GetChannelById(nChannelId);
+    if (pChannel && pChannel->GetChannelData())
+    {
+        ePolicy = pChannel->GetChannelData()->GetChannelPolicy();
+        nLagThreshold = pChannel->GetChannelData()->GetShmHeader()->nLagThreshold;
+        return RC::SUCCESS;
     }
     return RC::NOT_FOUND;
 }
@@ -212,8 +341,128 @@ RC ITeleport::Close(T_ID nChannelId, T_BOOL bSendMsgBeforeClose)
 
 
 //
+RC ITeleport::RegisterRpcService(T_PCSTR strTopic, TLP_RPC_HANDLER pHandler, T_BOOL bGlobal)
+{
+    if (!strTopic || !pHandler)
+    {
+        return RC::INVALID_PARAM;
+    }
+    std::lock_guard<std::mutex> lk(g_mRpcLock);
+    g_mRpcHandlers[strTopic] = pHandler;
+    T_ID nChId = 0;
+    RC rc = ITeleport::Open(strTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nChId, RpcServerCallback, bGlobal);
+    if (IS_SUCCESS(rc))
+    {
+        g_mRpcServerChannels[strTopic] = nChId;
+    }
+    return rc;
+}
+
+
+//
+RC ITeleport::UnregisterRpcService(T_PCSTR strTopic)
+{
+    if (!strTopic) return RC::INVALID_PARAM;
+    std::lock_guard<std::mutex> lk(g_mRpcLock);
+    auto it = g_mRpcServerChannels.find(strTopic);
+    if (it != g_mRpcServerChannels.end())
+    {
+        ITeleport::Close(it->second, T_TRUE);
+        g_mRpcServerChannels.erase(it);
+    }
+    g_mRpcHandlers.erase(strTopic);
+    return RC::SUCCESS;
+}
+
+
+//
+RC ITeleport::Call(T_PCSTR strTopic, T_PCVOID pReqData, T_UINT32 nReqLen, T_PVOID pRespData, T_UINT32& nRespLen, T_UINT32 nTimeoutMs, T_BOOL bGlobal)
+{
+    if (!strTopic)
+    {
+        return RC::INVALID_PARAM;
+    }
+
+    std::string replyTopic = "_rpc_rep_" + std::to_string(TGetProcId()) + "_" + std::to_string(TGetThreadId());
+    T_ID nReplyChId = 0;
+    RC rc = ITeleport::Open(replyTopic.c_str(), CH_LISTEN | CH_CREATE_IF_NOEXIST, nReplyChId, RpcClientReplyCallback, bGlobal);
+    if (IS_FAILED(rc))
+    {
+        return rc;
+    }
+
+    uint64_t correlationId = ((uint64_t)TGetProcId() << 32) | g_nRpcSeqCounter.fetch_add(1);
+    RpcPendingCall call;
+    {
+        std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
+        g_mPendingCalls[correlationId] = &call;
+    }
+
+    std::vector<uint8_t> reqBuf(sizeof(TRpcEnvelope) + nReqLen);
+    TRpcEnvelope* pEnv = (TRpcEnvelope*)reqBuf.data();
+    pEnv->nCorrelationId = correlationId;
+    pEnv->nBodyLength = nReqLen;
+    pEnv->nReserved = 0;
+    memset(pEnv->szReplyTopic, 0, sizeof(pEnv->szReplyTopic));
+    strncpy(pEnv->szReplyTopic, replyTopic.c_str(), sizeof(pEnv->szReplyTopic) - 1);
+    if (pReqData && nReqLen > 0)
+    {
+        memcpy(reqBuf.data() + sizeof(TRpcEnvelope), pReqData, nReqLen);
+    }
+
+    T_ID nTargetChId = 0;
+    rc = ITeleport::Open(strTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nTargetChId, T_NULL, bGlobal);
+    if (IS_FAILED(rc))
+    {
+        std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
+        g_mPendingCalls.erase(correlationId);
+        return rc;
+    }
+
+    rc = ITeleport::Send(nTargetChId, reqBuf.data(), (T_UINT32)reqBuf.size(), LOG_RECORD_FLAG_RPC_REQ, correlationId);
+    if (IS_FAILED(rc))
+    {
+        std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
+        g_mPendingCalls.erase(correlationId);
+        return rc;
+    }
+
+    std::unique_lock<std::mutex> clk(call.mtx);
+    bool ok = call.cv.wait_for(clk, std::chrono::milliseconds(nTimeoutMs), [&] { return call.completed; });
+
+    {
+        std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
+        g_mPendingCalls.erase(correlationId);
+    }
+
+    if (!ok)
+    {
+        return RC::TIMEOUT;
+    }
+
+    if (call.status == RC::SUCCESS)
+    {
+        T_UINT32 copyLen = (nRespLen < (T_UINT32)call.respData.size()) ? nRespLen : (T_UINT32)call.respData.size();
+        if (pRespData && copyLen > 0)
+        {
+            memcpy(pRespData, call.respData.data(), copyLen);
+        }
+        if (nRespLen < (T_UINT32)call.respData.size())
+        {
+            nRespLen = (T_UINT32)call.respData.size();
+            return RC::EXCEED_LIMIT;
+        }
+        nRespLen = (T_UINT32)call.respData.size();
+    }
+    return call.status;
+}
+
+
+//
 CChannel* CChannelMgr::GetChannelByName(T_PCSTR pChannelName)
 {
+    if (!pChannelName) return T_NULL;
+    std::lock_guard<std::mutex> lock(m_mtxChannels);
     T_CHANNEL_NAME_MAP::iterator it = m_mName2Channels.find(pChannelName);
     if (it != m_mName2Channels.end())
     {
@@ -229,7 +478,11 @@ RC CChannelMgr::ValidateChannelParam(T_PCSTR strChannelName,
     T_UINT32 nFlag, 
     TLP_CALLBACK pCallback)
 {
-    if (!strChannelName||!pCallback)
+    if (!strChannelName)
+    {
+        return RC::INVALID_PARAM;
+    }
+    if ((nFlag & CH_LISTEN) && !pCallback)
     {
         return RC::INVALID_PARAM;
     }
@@ -254,6 +507,7 @@ CChannel* CChannelMgr::GetChannelById(T_ID nChannelId)
     {
         return T_NULL;
     }
+    std::lock_guard<std::mutex> lock(m_mtxChannels);
     for (T_CHANNEL_ID_MAP::iterator it = m_mId2Channels.begin();
         it != m_mId2Channels.end();
         it++)
@@ -299,17 +553,20 @@ T_STRING CChannelMgr::MakeObjectName()
 
 
 //
-CChannel* CChannelMgr::CreateChannel(T_PCSTR strChannelName, T_BOOL bGlobal)
+CChannel* CChannelMgr::CreateChannel(T_PCSTR strChannelName, T_BOOL bGlobal, ChannelPolicy ePolicy)
 {
     ScopedLock<NamedMutex> Lock(*m_pChannelShmMutex);
     T_ID nChannelId         = MakeChannelId(strChannelName, bGlobal);
     TPChannelRecord pRecord = FindChannelRecordById(nChannelId);
     T_STRING strGUID        = pRecord ? pRecord->Guid : "";
-    CChannel* pChannel      = new CChannel(strChannelName, nChannelId, m_hStopEvent, strGUID, bGlobal);
+    CChannel* pChannel      = new CChannel(strChannelName, nChannelId, m_hStopEvent, strGUID, bGlobal, ePolicy);
     if(pChannel)
     {
-        m_mId2Channels.emplace(nChannelId, pChannel);
-        m_mName2Channels.emplace(strChannelName, pChannel);
+        {
+            std::lock_guard<std::mutex> lock(m_mtxChannels);
+            m_mId2Channels.emplace(nChannelId, pChannel);
+            m_mName2Channels.emplace(strChannelName, pChannel);
+        }
         if (!pRecord)
         {
             pRecord = FindAvailableChannelRecord();
@@ -457,12 +714,13 @@ CChannelMgr::~CChannelMgr()
 
 
 //
-CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T_STRING strGUID, T_BOOL bGlobal) :
+CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T_STRING strGUID, T_BOOL bGlobal, ChannelPolicy ePolicy) :
     m_strChannelName(""),
     m_nChannelId(nChannelId),
     m_nMsgId(0),
     m_bActivated(T_TRUE),
     m_bWriting(T_FALSE),
+    m_ePolicy(ePolicy),
     m_strNamedObjName(""),
     m_strGUID(strGUID),
     m_pAckRecord(T_NULL),
@@ -500,7 +758,7 @@ CChannel::CChannel(T_PCSTR pChannelName, T_ID nChannelId, T_HANDLE hStopEvent, T
     {
         LogVital("CChannel: Failed to create NamedEvent object!");
     }
-    m_pChannelData = new CChannelData(m_strNamedObjName.c_str(), DEFAULT_SHM_SIZE);
+    m_pChannelData = new CChannelData(m_strNamedObjName.c_str(), DEFAULT_SHM_SIZE, ePolicy);
     if (!m_pChannelData)
     {
         LogVital("CChannel: Failed to create CChannelData object!");
@@ -528,19 +786,19 @@ CChannel::~CChannel()
 
 
 //
-RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
+RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
     if (!m_bActivated)
     {
         return RC::CLOSED;
     }
-    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    if (nSizeInByte > MAX_LOG_MESSAGE_SIZE)
     {
         return RC::EXCEED_LIMIT;
     }
     T_MSG_ID nOutMsgId = 0;
     m_bWriting = T_TRUE;
-    RC rc = m_pChannelData->WriteRingMsg(pData, nSizeInByte, nOutMsgId, m_nProcId);
+    RC rc = m_pChannelData->WriteRingMsg(pData, nSizeInByte, nOutMsgId, m_nProcId, nFlags, nCorrelationId);
     m_bWriting = T_FALSE;
     if (IS_SUCCESS(rc))
     {
@@ -554,13 +812,13 @@ RC CChannel::Publish(T_PCVOID pData, T_UINT32 nSizeInByte)
 
 
 //
-RC CChannel::AcquireBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+RC CChannel::AcquireBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
     if (!m_bActivated)
     {
         return RC::CLOSED;
     }
-    return m_pChannelData->AcquireRingBuffer(nSizeInByte, pBuffer, nToken);
+    return m_pChannelData->AcquireRingBuffer(nSizeInByte, pBuffer, nToken, nFlags, nCorrelationId);
 }
 
 
@@ -600,11 +858,13 @@ RC CChannel::Subscribe(OpenFlag Flag, T_BOOL bGlobal)
         return RC::EXCEED_LIMIT;
     }
     LogInfo("Channel#%d proc %d was subscribed.", m_nChannelId, m_nProcId);
-    pRecord->ProcId        = m_nProcId;
-    pRecord->AckFlag       = ACK_FLAG::INIT;
-    pRecord->LastReadSeq   = m_pChannelData->GetShmHeader()->PubHeader.WriteCursor;
-    pRecord->HeartbeatTick = 0;
-    pRecord->Status        = 1;
+    pRecord->ProcId         = m_nProcId;
+    pRecord->AckFlag        = ACK_FLAG::INIT;
+    pRecord->LastReadSeq    = m_pChannelData->GetShmHeader()->PubHeader.WriteMsgSeq;
+    pRecord->LastReadOffset = m_pChannelData->GetShmHeader()->PubHeader.WriteCursor;
+    pRecord->HeartbeatTick  = 0;
+    pRecord->Status         = SUB_STATUS_ACTIVE;
+    pRecord->DropCount      = 0;
     RC rc = AddSession(Flag, pRecord);
     m_pChannelData->UnlockHdr();
     CHK_RC(rc);
@@ -625,7 +885,10 @@ RC CChannel::Unsubscribe(T_ID nProcId)
     m_pChannelData->LockHdr();
     m_pAckRecord->ProcId = 0;
     m_pAckRecord->LastReadSeq = 0;
+    m_pAckRecord->LastReadOffset = 0;
     m_pAckRecord->AckFlag = ACK_FLAG::NONE;
+    m_pAckRecord->Status = SUB_STATUS_ACTIVE;
+    m_pAckRecord->DropCount = 0;
     m_pChannelData->UnlockHdr();
     m_pChannelData->IncDecSubscriber(T_FALSE);
     
@@ -696,7 +959,7 @@ RC CChannel::WaitAllEventDone()
     m_bActivated = T_FALSE;
     T_UINT64 writeCursor = m_pChannelData->GetShmHeader()->PubHeader.WriteCursor;
     T_UINT32 nWait = 0;
-    while (m_pChannelData->GetMinSubscriberSequence() < writeCursor && nWait++ < 500)
+    while (m_pChannelData->GetMinSubscriberOffset() < writeCursor && nWait++ < 500)
     {
         TSleep(10);
     }
@@ -741,7 +1004,8 @@ RC CChannel::PutCallbackMsg(MsgType msgType,
     T_ID nProcId,
     T_PVOID pData, 
     T_UINT32 nLength, 
-    RC result)
+    RC result,
+    T_UINT64 nCorrelationId)
 {
     if(!m_pCallback)
     {
@@ -755,6 +1019,7 @@ RC CChannel::PutCallbackMsg(MsgType msgType,
     msg.eResult        = result;
     msg.pData          = pData;
     msg.nLength        = nLength;
+    msg.nCorrelationId = nCorrelationId;
     m_qCallbackQueue.Push(msg);
     m_pEventCallback->Post(T_FALSE);
     return RC::SUCCESS;
@@ -889,23 +1154,40 @@ RC CChannel::RunSubThread()
         T_UINT32 nSize = 0;
         T_MSG_ID nMsgId = 0;
         T_ID nSenderProcId = 0;
+        T_UINT32 nFlags = 0;
+        T_UINT64 nCorrelationId = 0;
 
-        RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nMsgId, nSenderProcId);
+        RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nMsgId, nSenderProcId, nFlags, nCorrelationId);
         if (IS_SUCCESS(rc))
         {
             if (m_pCallback)
             {
+                if (m_pAckRecord->Status == SUB_STATUS_DROPPED)
+                {
+                    TCbMessage dropMsg;
+                    dropMsg.eType = MsgType::MSG_DROPPED;
+                    dropMsg.nChannelId = m_nChannelId;
+                    dropMsg.nProcessId = nSenderProcId;
+                    dropMsg.nOriginalMsgId = nMsgId;
+                    dropMsg.eResult = RC::SUCCESS;
+                    dropMsg.pData = T_NULL;
+                    dropMsg.nLength = m_pAckRecord->DropCount;
+                    dropMsg.nCorrelationId = 0;
+                    m_pCallback(&dropMsg);
+                    m_pAckRecord->Status = SUB_STATUS_ACTIVE;
+                }
                 TCbMessage cbMsg;
-                cbMsg.eType = MsgType::MSG_SUB_GET;
+                cbMsg.eType = (nFlags & LOG_RECORD_FLAG_RPC_REQ) ? MsgType::MSG_RPC_REQ :
+                              (nFlags & LOG_RECORD_FLAG_RPC_RESP) ? MsgType::MSG_RPC_RESP : MsgType::MSG_SUB_GET;
                 cbMsg.nChannelId = m_nChannelId;
                 cbMsg.nProcessId = nSenderProcId;
                 cbMsg.nOriginalMsgId = nMsgId;
                 cbMsg.eResult = RC::SUCCESS;
                 cbMsg.pData = pData;
                 cbMsg.nLength = nSize;
+                cbMsg.nCorrelationId = nCorrelationId;
                 m_pCallback(&cbMsg);
             }
-            m_pAckRecord->LastReadSeq = nMsgId;
             m_pAckRecord->AckFlag = ACK_FLAG::DONE;
             if (m_pChannelData->GetShmHeader()->nWaitingPubs > 0)
             {
@@ -916,8 +1198,7 @@ RC CChannel::RunSubThread()
         else if (rc == RC::FAILED)
         {
             LogWarn("Channel %s: Discarding corrupted slot sequence %llu",
-                m_strChannelName.c_str(), (T_UINT64)(m_pAckRecord->LastReadSeq + 1));
-            m_pAckRecord->LastReadSeq++;
+                m_strChannelName.c_str(), (T_UINT64)(m_pAckRecord->LastReadSeq));
             continue;
         }
         else
@@ -928,8 +1209,8 @@ RC CChannel::RunSubThread()
             __sync_add_and_fetch(&m_pChannelData->GetShmHeader()->nWaitingSubs, 1);
 #endif
             T_UINT64 targetSeq = m_pAckRecord->LastReadSeq + 1;
-            TPRingSlot pSlot = m_pChannelData->GetSlot((T_UINT32)(targetSeq & RING_SLOT_MASK));
-            if (pSlot->nSequence != targetSeq && !m_bStopped)
+            TPLogRecordHeader pRec = m_pChannelData->GetRecordHeader(m_pAckRecord->LastReadOffset);
+            if (pRec->nSequence != targetSeq && !m_bStopped)
             {
                 m_pEventSubRead->Wait(1);
             }
@@ -957,31 +1238,44 @@ RC CChannel::ReadMsg(T_ID nProcId, T_MSG_ID nMsgId)
     T_UINT32 nSize = 0;
     T_MSG_ID nOutMsgId = 0;
     T_ID nSenderProcId = 0;
-    RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nOutMsgId, nSenderProcId);
+    T_UINT32 nFlags = 0;
+    T_UINT64 nCorrelationId = 0;
+    RC rc = m_pChannelData->ReadRingMsg(m_pAckRecord, pData, nSize, nOutMsgId, nSenderProcId, nFlags, nCorrelationId);
     if (IS_SUCCESS(rc))
     {
         if (m_pCallback)
         {
+            if (m_pAckRecord->Status == SUB_STATUS_DROPPED)
+            {
+                TCbMessage dropMsg;
+                dropMsg.eType = MsgType::MSG_DROPPED;
+                dropMsg.nChannelId = m_nChannelId;
+                dropMsg.nProcessId = nSenderProcId;
+                dropMsg.nOriginalMsgId = nOutMsgId;
+                dropMsg.eResult = RC::SUCCESS;
+                dropMsg.pData = T_NULL;
+                dropMsg.nLength = m_pAckRecord->DropCount;
+                dropMsg.nCorrelationId = 0;
+                m_pCallback(&dropMsg);
+                m_pAckRecord->Status = SUB_STATUS_ACTIVE;
+            }
             TCbMessage cbMsg;
-            cbMsg.eType = MsgType::MSG_SUB_GET;
+            cbMsg.eType = (nFlags & LOG_RECORD_FLAG_RPC_REQ) ? MsgType::MSG_RPC_REQ :
+                          (nFlags & LOG_RECORD_FLAG_RPC_RESP) ? MsgType::MSG_RPC_RESP : MsgType::MSG_SUB_GET;
             cbMsg.nChannelId = m_nChannelId;
             cbMsg.nProcessId = nSenderProcId;
             cbMsg.nOriginalMsgId = nOutMsgId;
             cbMsg.eResult = RC::SUCCESS;
             cbMsg.pData = pData;
             cbMsg.nLength = nSize;
+            cbMsg.nCorrelationId = nCorrelationId;
             m_pCallback(&cbMsg);
-        }
-        m_pAckRecord->LastReadSeq = nOutMsgId;
-        m_pAckRecord->AckFlag = ACK_FLAG::DONE;
-        if (m_pChannelData->GetShmHeader()->nWaitingPubs > 0)
-        {
-            m_pEventReadDone->Post(T_FALSE);
         }
         return RC::SUCCESS;
     }
     return rc;
 }
+
 
 
 //
@@ -1033,19 +1327,29 @@ RC CChannel::RunCallback()
 
 
 //
-CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte) :
+CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte, ChannelPolicy ePolicy) :
     m_pSharedMemory(T_NULL),
-    m_nDataOffset(0)
+    m_pChannelHdrMutex(T_NULL),
+    m_pChannelDataMutex(T_NULL),
+    m_pChannelHeader(T_NULL),
+    m_pShmDataAddr(T_NULL),
+    m_nDataOffset(0),
+    m_nLogBufferSize(0),
+    m_nLogBufferMask(0)
 {
-    m_nDataOffset = sizeof(TChannelShmHeader);
+    if (nShmSizeInByte < DEFAULT_SHM_SIZE)
+    {
+        nShmSizeInByte = DEFAULT_SHM_SIZE;
+    }
+    m_nDataOffset = (sizeof(TChannelShmHeader) + 4095) & ~4095;
     T_STRING strShmName = pChannelObjName;
     strShmName += "_shm";
     m_pSharedMemory = new SharedMemory(strShmName.c_str(), nShmSizeInByte + m_nDataOffset);
-    if(!m_pSharedMemory || !m_pSharedMemory->IsValid())
+    if (!m_pSharedMemory || !m_pSharedMemory->IsValid())
     {
         LogVital("CChannelData::Failed to create SharedMemory object.");
     }
-    m_pChannelHdrMutex  = new NamedMutex((strShmName+"_hdrmutex").c_str());
+    m_pChannelHdrMutex = new NamedMutex((strShmName + "_hdrmutex").c_str());
     m_pChannelDataMutex = new NamedMutex((strShmName + "_datamutex").c_str());
 
     if (!m_pChannelHdrMutex || !m_pChannelDataMutex)
@@ -1053,24 +1357,44 @@ CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte) :
         LogVital("CChannelData::Failed to create named mutex.");
     }
     m_pChannelHeader = (TPChannelShmHeader)m_pSharedMemory->Begin();
-    m_pShmDataAddr   = m_pSharedMemory->Begin() + m_nDataOffset;
+    m_pShmDataAddr = m_pSharedMemory->Begin() + m_nDataOffset;
+
+    // Calculate power of 2 continuous log buffer size
+    T_UINT32 rawBufferSize = m_pSharedMemory->GetSize() - m_nDataOffset;
+    T_UINT32 bufSize = 1;
+    while ((bufSize << 1) <= rawBufferSize)
+    {
+        bufSize <<= 1;
+    }
+    m_nLogBufferSize = bufSize;
+    m_nLogBufferMask = bufSize - 1;
 
     LockHdr();
     if (m_pChannelHeader->nMagic != TELEPORT_MAGIC)
     {
-        m_pChannelHeader->nMagic          = TELEPORT_MAGIC;
-        m_pChannelHeader->nVersion        = TELEPORT_VERSION;
-        m_pChannelHeader->nUnreadCnt      = 0;
-        m_pChannelHeader->nSubscribers    = 0;
-        m_pChannelHeader->nOriginalMsgId  = 0;
+        m_pChannelHeader->nMagic = TELEPORT_MAGIC;
+        m_pChannelHeader->nVersion = TELEPORT_VERSION;
+        m_pChannelHeader->nUnreadCnt = 0;
+        m_pChannelHeader->nSubscribers = 0;
+        m_pChannelHeader->nOriginalMsgId = 0;
         m_pChannelHeader->nOriginalProcId = 0;
-        m_pChannelHeader->nSlotCount      = RING_SLOT_COUNT;
-        m_pChannelHeader->nSlotSize       = sizeof(TRingSlot);
-        m_pChannelHeader->PubHeader.WriteCursor  = 0;
+        m_pChannelHeader->nBufferSize = m_nLogBufferSize;
+        m_pChannelHeader->nBufferMask = m_nLogBufferMask;
+        m_pChannelHeader->nPolicy = ePolicy;
+        m_pChannelHeader->nLagThreshold = (m_nLogBufferSize * 3) / 4;
+        m_pChannelHeader->PubHeader.WriteCursor = 0;
         m_pChannelHeader->PubHeader.CommitCursor = 0;
-        m_pChannelHeader->nWaitingSubs           = 0;
-        m_pChannelHeader->nWaitingPubs           = 0;
+        m_pChannelHeader->PubHeader.WriteMsgSeq = 0;
+        m_pChannelHeader->PubHeader.CommitMsgSeq = 0;
+        m_pChannelHeader->PubHeader.SpinLock = 0;
+        m_pChannelHeader->nWaitingSubs = 0;
+        m_pChannelHeader->nWaitingPubs = 0;
         memset((void*)m_pChannelHeader->AckRecords, 0, sizeof(m_pChannelHeader->AckRecords));
+    }
+    else
+    {
+        m_nLogBufferSize = m_pChannelHeader->nBufferSize;
+        m_nLogBufferMask = m_pChannelHeader->nBufferMask;
     }
     UnlockHdr();
 }
@@ -1083,9 +1407,11 @@ CChannelData::CChannelData():
     m_pChannelDataMutex(T_NULL),
     m_pChannelHeader(T_NULL),
     m_pShmDataAddr(T_NULL),
-    m_nDataOffset(0)
+    m_nDataOffset(0),
+    m_nLogBufferSize(0),
+    m_nLogBufferMask(0)
 {
-    m_nDataOffset = sizeof(TChannelShmHeader);
+    m_nDataOffset = (sizeof(TChannelShmHeader) + 4095) & ~4095;
 }
 
 
@@ -1111,15 +1437,16 @@ RC CChannelData::Write(T_PCVOID pData, T_UINT32 nSizeInByte)
 //
 RC CChannelData::Read(T_PVOID& pData, T_UINT32& nSizeInByte)
 {
-    TPRingSlot pSlot = GetSlot((T_UINT32)(m_pChannelHeader->PubHeader.CommitCursor & RING_SLOT_MASK));
-    nSizeInByte = pSlot->nLength;
+    T_UINT32 offset = (T_UINT32)(m_pChannelHeader->PubHeader.CommitCursor & m_nLogBufferMask);
+    TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + offset);
+    nSizeInByte = pRec->nLength;
     pData = malloc(nSizeInByte + 2);
     if (!pData)
     {
         return RC::OUT_OF_MEMORY;
     }
     memset(pData, 0, nSizeInByte + 2);
-    memcpy_s(pData, nSizeInByte, (const void*)pSlot->Data, nSizeInByte);
+    memcpy_s(pData, nSizeInByte, (const void*)(pRec + 1), nSizeInByte);
     return RC::SUCCESS;
 }
 
@@ -1270,8 +1597,29 @@ RC CChannelData::IncDecSubscriber(T_BOOL bIncrease)
 //
 TPRingSlot CChannelData::GetSlot(T_UINT32 nIndex)
 {
-    T_UINT32 nIdx = nIndex & RING_SLOT_MASK;
-    return (TPRingSlot)(m_pShmDataAddr + (nIdx * sizeof(TRingSlot)));
+    T_UINT32 offset = (T_UINT32)(nIndex & m_nLogBufferMask);
+    return (TPRingSlot)(m_pShmDataAddr + offset);
+}
+
+TPLogRecordHeader CChannelData::GetRecordHeader(T_UINT64 nTokenOrSeq)
+{
+    T_UINT32 offset = (T_UINT32)(nTokenOrSeq & m_nLogBufferMask);
+    return (TPLogRecordHeader)(m_pShmDataAddr + offset);
+}
+
+T_VOID CChannelData::SetChannelPolicy(ChannelPolicy ePolicy, T_UINT32 nLagThreshold)
+{
+    ScopedLock<NamedMutex> Lock(*m_pChannelHdrMutex);
+    m_pChannelHeader->nPolicy = ePolicy;
+    if (nLagThreshold > 0)
+    {
+        m_pChannelHeader->nLagThreshold = nLagThreshold;
+    }
+}
+
+ChannelPolicy CChannelData::GetChannelPolicy()
+{
+    return m_pChannelHeader->nPolicy;
 }
 
 
@@ -1289,7 +1637,10 @@ T_VOID CChannelData::CleanZombieSubscribers()
                 LogWarn("Zombie subscriber (ProcId: %d) cleaned up.", pRecord->ProcId);
                 pRecord->ProcId = 0;
                 pRecord->LastReadSeq = 0;
+                pRecord->LastReadOffset = 0;
                 pRecord->AckFlag = ACK_FLAG::NONE;
+                pRecord->Status = SUB_STATUS_ACTIVE;
+                pRecord->DropCount = 0;
                 if (m_pChannelHeader->nSubscribers > 0)
                 {
                     m_pChannelHeader->nSubscribers--;
@@ -1302,12 +1653,63 @@ T_VOID CChannelData::CleanZombieSubscribers()
 
 
 //
-T_UINT64 CChannelData::GetMinSubscriberSequence()
+T_UINT64 CChannelData::GetMinSubscriberOffset()
 {
     T_SHORT nTotalSubs = m_pChannelHeader->nSubscribers;
     if (nTotalSubs <= 0)
     {
         return m_pChannelHeader->PubHeader.WriteCursor;
+    }
+
+    T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+    T_UINT64 nMinOffset = UINT64_MAX;
+    T_SHORT nFound = 0;
+    TPAckRecord pRecord = m_pChannelHeader->AckRecords;
+
+    for (T_UINT32 i = 0; i < MAX_SUBSCRIBERS_PER_CHANNEL && nFound < nTotalSubs; i++)
+    {
+        if (pRecord->ProcId != 0)
+        {
+            nFound++;
+            // Check for POLICY_ISOLATE_SLOW_CONSUMER
+            if (m_pChannelHeader->nPolicy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER)
+            {
+                if (currentWrite > pRecord->LastReadOffset + m_pChannelHeader->nLagThreshold)
+                {
+                    pRecord->Status = SUB_STATUS_ISOLATED;
+                    pRecord++;
+                    continue;
+                }
+                else
+                {
+                    pRecord->Status = SUB_STATUS_ACTIVE;
+                }
+            }
+
+            T_UINT64 nOffset = pRecord->LastReadOffset;
+            if (nOffset < nMinOffset)
+            {
+                nMinOffset = nOffset;
+            }
+        }
+        pRecord++;
+    }
+
+    if (nMinOffset == UINT64_MAX)
+    {
+        return currentWrite;
+    }
+    return nMinOffset;
+}
+
+
+//
+T_UINT64 CChannelData::GetMinSubscriberSequence()
+{
+    T_SHORT nTotalSubs = m_pChannelHeader->nSubscribers;
+    if (nTotalSubs <= 0)
+    {
+        return m_pChannelHeader->PubHeader.WriteMsgSeq;
     }
     T_UINT64 nMinSeq = UINT64_MAX;
     T_SHORT nFound = 0;
@@ -1317,6 +1719,12 @@ T_UINT64 CChannelData::GetMinSubscriberSequence()
         if (pRecord->ProcId != 0)
         {
             nFound++;
+            if (m_pChannelHeader->nPolicy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER &&
+                pRecord->Status == SUB_STATUS_ISOLATED)
+            {
+                pRecord++;
+                continue;
+            }
             T_UINT64 nSeq = pRecord->LastReadSeq;
             if (nSeq < nMinSeq)
             {
@@ -1325,111 +1733,142 @@ T_UINT64 CChannelData::GetMinSubscriberSequence()
         }
         pRecord++;
     }
-    if (nFound == 0)
+    if (nMinSeq == UINT64_MAX)
     {
-        return m_pChannelHeader->PubHeader.WriteCursor;
+        return m_pChannelHeader->PubHeader.WriteMsgSeq;
     }
     return nMinSeq;
 }
 
 
 //
-RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nOutMsgId, T_ID nSenderProcId)
+RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nOutMsgId, T_ID nSenderProcId, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
-    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    if (nSizeInByte > MAX_LOG_MESSAGE_SIZE)
     {
         return RC::EXCEED_LIMIT;
     }
 
+    T_UINT32 nRecordSize = (sizeof(TLogRecordHeader) + nSizeInByte + 63) & ~63;
+    if (nRecordSize > m_nLogBufferSize / 2)
+    {
+        return RC::EXCEED_LIMIT;
+    }
+
+    ChannelPolicy policy = m_pChannelHeader->nPolicy;
+
+    // Allocate in Continuous Log Buffer under spinlock for strictly ordered (writeStart, nextSeq)
+    T_UINT64 writeStart = 0;
     T_UINT64 nextSeq = 0;
     T_UINT32 nSpin = 0;
-    T_UINT64 cachedMinSeq = 0;
     while (true)
     {
-        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
-        if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
-        {
-            cachedMinSeq = GetMinSubscriberSequence();
-            if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
-            {
-                if (++nSpin < 500)
-                {
-                    T_CPU_PAUSE();
-                }
-                else if (nSpin < 550)
-                {
-                    T_THREAD_YIELD();
-                }
-                else
-                {
-                    CleanZombieSubscribers();
-                    cachedMinSeq = GetMinSubscriberSequence();
-                    TSleep(1);
-                }
-                continue;
-            }
-        }
-
-        nextSeq = currentWrite + 1;
 #ifdef Windows
-        if ((T_UINT64)InterlockedCompareExchange64(
-            (LONG64*)&m_pChannelHeader->PubHeader.WriteCursor,
-            (LONG64)nextSeq,
-            (LONG64)currentWrite) == currentWrite)
+        while (InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
         {
-            break;
+            T_CPU_PAUSE();
         }
 #else
-        if (__sync_bool_compare_and_swap(
-            &m_pChannelHeader->PubHeader.WriteCursor,
-            currentWrite,
-            nextSeq))
+        while (!__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
         {
-            break;
+            T_CPU_PAUSE();
         }
 #endif
-        T_CPU_PAUSE();
+
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        T_UINT64 minOffset = GetMinSubscriberOffset();
+        if ((policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER) &&
+            (currentWrite + nRecordSize > minOffset + m_nLogBufferSize))
+        {
+#ifdef Windows
+            InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+#else
+            __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+#endif
+            if (++nSpin < 500)
+            {
+                T_CPU_PAUSE();
+            }
+            else if (nSpin < 550)
+            {
+                T_THREAD_YIELD();
+            }
+            else
+            {
+                CleanZombieSubscribers();
+                TSleep(1);
+            }
+            continue;
+        }
+
+        T_UINT32 offset = (T_UINT32)(currentWrite & m_nLogBufferMask);
+        T_UINT32 remaining = m_nLogBufferSize - offset;
+
+        if (remaining < nRecordSize)
+        {
+            T_UINT32 paddingSize = remaining;
+            TPLogRecordHeader pPad = (TPLogRecordHeader)(m_pShmDataAddr + offset);
+            pPad->nMagic = 0;
+            pPad->nSequence = 0;
+            pPad->nLength = 0;
+            pPad->nRecordSize = paddingSize;
+            pPad->nFlags = LOG_RECORD_FLAG_PADDING;
+            pPad->nChecksum = 0;
+            pPad->nSenderProcId = 0;
+            pPad->nCorrelationId = 0;
+#ifdef Windows
+            MemoryBarrier();
+#else
+            __sync_synchronize();
+#endif
+            pPad->nMagic = TELEPORT_MAGIC;
+
+            currentWrite += paddingSize;
+        }
+
+        writeStart = currentWrite;
+        m_pChannelHeader->PubHeader.WriteCursor = currentWrite + nRecordSize;
+        nextSeq = ++m_pChannelHeader->PubHeader.WriteMsgSeq;
+
+#ifdef Windows
+        InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+#else
+        __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+#endif
+        break;
     }
 
-    TPRingSlot pSlot = GetSlot((T_UINT32)(nextSeq & RING_SLOT_MASK));
-    pSlot->nMagic = 0;
+    T_UINT32 recordOffset = (T_UINT32)(writeStart & m_nLogBufferMask);
+    TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + recordOffset);
+    pRec->nMagic = 0;
+    pRec->nSequence = 0;
+
+    void* pPayload = (void*)(pRec + 1);
     if (pData && nSizeInByte > 0)
     {
-        memcpy((void*)pSlot->Data, pData, nSizeInByte);
+        memcpy(pPayload, pData, nSizeInByte);
     }
-    if (nSizeInByte < MAX_SLOT_DATA_SIZE)
-    {
-        pSlot->Data[nSizeInByte] = 0;
-    }
-    pSlot->nLength = nSizeInByte;
-    pSlot->nSenderProcId = nSenderProcId;
-    pSlot->nChecksum = TComputeCRC32((void*)pSlot->Data, nSizeInByte);
-    pSlot->nFlags = 0;
-    pSlot->nReserved = 0;
-    pSlot->nMagic = TELEPORT_MAGIC;
+
+    pRec->nLength = nSizeInByte;
+    pRec->nRecordSize = nRecordSize;
+    pRec->nFlags = nFlags | LOG_RECORD_FLAG_DATA;
+    pRec->nSenderProcId = nSenderProcId;
+    pRec->nCorrelationId = nCorrelationId;
+    pRec->nChecksum = TComputeCRC32(pPayload, nSizeInByte);
+    pRec->nMagic = TELEPORT_MAGIC;
 
 #ifdef Windows
     MemoryBarrier();
 #else
     __sync_synchronize();
 #endif
-    pSlot->nSequence = nextSeq;
+    pRec->nSequence = nextSeq;
 
-    T_UINT64 commitCur = m_pChannelHeader->PubHeader.CommitCursor;
-    if (commitCur + 1 == nextSeq)
-    {
 #ifdef Windows
-        InterlockedCompareExchange64(
-            (LONG64*)&m_pChannelHeader->PubHeader.CommitCursor,
-            (LONG64)nextSeq,
-            (LONG64)commitCur);
+    InterlockedCompareExchange64((LONG64*)&m_pChannelHeader->PubHeader.CommitCursor, (LONG64)(writeStart + nRecordSize), (LONG64)writeStart);
 #else
-        __sync_bool_compare_and_swap(
-            &m_pChannelHeader->PubHeader.CommitCursor,
-            commitCur,
-            nextSeq);
+    __sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.CommitCursor, writeStart, writeStart + nRecordSize);
 #endif
-    }
 
     nOutMsgId = nextSeq;
     m_pChannelHeader->nOriginalMsgId = nextSeq;
@@ -1439,68 +1878,111 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
 
 
 //
-RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken)
+RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UINT64& nToken, T_UINT32 nFlags, T_UINT64 nCorrelationId)
 {
-    if (nSizeInByte > MAX_SLOT_DATA_SIZE)
+    if (nSizeInByte > MAX_LOG_MESSAGE_SIZE)
+    {
+        return RC::EXCEED_LIMIT;
+    }
+    T_UINT32 nRecordSize = (sizeof(TLogRecordHeader) + nSizeInByte + 63) & ~63;
+    if (nRecordSize > m_nLogBufferSize / 2)
     {
         return RC::EXCEED_LIMIT;
     }
 
+    ChannelPolicy policy = m_pChannelHeader->nPolicy;
+
+    T_UINT64 writeStart = 0;
     T_UINT64 nextSeq = 0;
     T_UINT32 nSpin = 0;
-    T_UINT64 cachedMinSeq = 0;
     while (true)
     {
-        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
-        if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
-        {
-            cachedMinSeq = GetMinSubscriberSequence();
-            if (currentWrite >= cachedMinSeq + RING_SLOT_COUNT)
-            {
-                if (++nSpin < 500)
-                {
-                    T_CPU_PAUSE();
-                }
-                else if (nSpin < 550)
-                {
-                    T_THREAD_YIELD();
-                }
-                else
-                {
-                    CleanZombieSubscribers();
-                    cachedMinSeq = GetMinSubscriberSequence();
-                    TSleep(1);
-                }
-                continue;
-            }
-        }
-
-        nextSeq = currentWrite + 1;
 #ifdef Windows
-        if ((T_UINT64)InterlockedCompareExchange64(
-            (LONG64*)&m_pChannelHeader->PubHeader.WriteCursor,
-            (LONG64)nextSeq,
-            (LONG64)currentWrite) == currentWrite)
+        while (InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
         {
-            break;
+            T_CPU_PAUSE();
         }
 #else
-        if (__sync_bool_compare_and_swap(
-            &m_pChannelHeader->PubHeader.WriteCursor,
-            currentWrite,
-            nextSeq))
+        while (!__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
         {
-            break;
+            T_CPU_PAUSE();
         }
 #endif
-        T_CPU_PAUSE();
+
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        T_UINT64 minOffset = GetMinSubscriberOffset();
+        if ((policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER) &&
+            (currentWrite + nRecordSize > minOffset + m_nLogBufferSize))
+        {
+#ifdef Windows
+            InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+#else
+            __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+#endif
+            if (++nSpin < 500)
+            {
+                T_CPU_PAUSE();
+            }
+            else if (nSpin < 550)
+            {
+                T_THREAD_YIELD();
+            }
+            else
+            {
+                CleanZombieSubscribers();
+                TSleep(1);
+            }
+            continue;
+        }
+
+        T_UINT32 offset = (T_UINT32)(currentWrite & m_nLogBufferMask);
+        T_UINT32 remaining = m_nLogBufferSize - offset;
+
+        if (remaining < nRecordSize)
+        {
+            T_UINT32 paddingSize = remaining;
+            TPLogRecordHeader pPad = (TPLogRecordHeader)(m_pShmDataAddr + offset);
+            pPad->nMagic = 0;
+            pPad->nSequence = 0;
+            pPad->nLength = 0;
+            pPad->nRecordSize = paddingSize;
+            pPad->nFlags = LOG_RECORD_FLAG_PADDING;
+            pPad->nChecksum = 0;
+            pPad->nSenderProcId = 0;
+            pPad->nCorrelationId = 0;
+#ifdef Windows
+            MemoryBarrier();
+#else
+            __sync_synchronize();
+#endif
+            pPad->nMagic = TELEPORT_MAGIC;
+
+            currentWrite += paddingSize;
+        }
+
+        writeStart = currentWrite;
+        m_pChannelHeader->PubHeader.WriteCursor = currentWrite + nRecordSize;
+        nextSeq = ++m_pChannelHeader->PubHeader.WriteMsgSeq;
+
+#ifdef Windows
+        InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+#else
+        __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+#endif
+        break;
     }
 
-    TPRingSlot pSlot = GetSlot((T_UINT32)(nextSeq & RING_SLOT_MASK));
-    pSlot->nMagic = 0;
-    pSlot->nLength = nSizeInByte;
-    pBuffer = (T_PVOID)pSlot->Data;
-    nToken = nextSeq;
+    T_UINT32 recordOffset = (T_UINT32)(writeStart & m_nLogBufferMask);
+    TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + recordOffset);
+    pRec->nMagic = 0;
+    pRec->nSequence = nextSeq;
+    pRec->nRecordSize = nRecordSize;
+    pRec->nLength = nSizeInByte;
+    pRec->nFlags = nFlags | LOG_RECORD_FLAG_DATA;
+    pRec->nCorrelationId = nCorrelationId;
+
+    pBuffer = (T_PVOID)(pRec + 1);
+    nToken = writeStart;
     return RC::SUCCESS;
 }
 
@@ -1508,55 +1990,43 @@ RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UIN
 //
 RC CChannelData::CommitRingBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte, T_ID nSenderProcId, T_MSG_ID& nOutMsgId)
 {
-    T_UINT64 seq = nToken;
-    TPRingSlot pSlot = GetSlot((T_UINT32)(seq & RING_SLOT_MASK));
+    T_UINT32 recordOffset = (T_UINT32)(nToken & m_nLogBufferMask);
+    TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + recordOffset);
     if (nSizeInByte == 0)
     {
-        nSizeInByte = pSlot->nLength;
+        nSizeInByte = pRec->nLength;
     }
-    if (nSizeInByte < MAX_SLOT_DATA_SIZE)
+    pRec->nLength = nSizeInByte;
+    pRec->nSenderProcId = nSenderProcId;
+    pRec->nChecksum = TComputeCRC32((void*)(pRec + 1), nSizeInByte);
+    if (pRec->nFlags & LOG_RECORD_FLAG_CORRUPT_CRC)
     {
-        pSlot->Data[nSizeInByte] = 0;
+        pRec->nChecksum ^= 0x12345678;
     }
-    pSlot->nLength = nSizeInByte;
-    pSlot->nSenderProcId = nSenderProcId;
-    pSlot->nChecksum = TComputeCRC32((void*)pSlot->Data, nSizeInByte);
-    pSlot->nFlags = 0;
-    pSlot->nReserved = 0;
-    pSlot->nMagic = TELEPORT_MAGIC;
+    pRec->nMagic = TELEPORT_MAGIC;
 
 #ifdef Windows
     MemoryBarrier();
 #else
     __sync_synchronize();
 #endif
-    pSlot->nSequence = seq;
+    T_UINT64 nextSeq = pRec->nSequence;
 
-    T_UINT64 commitCur = m_pChannelHeader->PubHeader.CommitCursor;
-    if (commitCur + 1 == seq)
-    {
 #ifdef Windows
-        InterlockedCompareExchange64(
-            (LONG64*)&m_pChannelHeader->PubHeader.CommitCursor,
-            (LONG64)seq,
-            (LONG64)commitCur);
+    InterlockedCompareExchange64((LONG64*)&m_pChannelHeader->PubHeader.CommitCursor, (LONG64)(nToken + pRec->nRecordSize), (LONG64)nToken);
 #else
-        __sync_bool_compare_and_swap(
-            &m_pChannelHeader->PubHeader.CommitCursor,
-            commitCur,
-            seq);
+    __sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.CommitCursor, nToken, nToken + pRec->nRecordSize);
 #endif
-    }
 
-    nOutMsgId = seq;
-    m_pChannelHeader->nOriginalMsgId = seq;
+    nOutMsgId = nextSeq;
+    m_pChannelHeader->nOriginalMsgId = nextSeq;
     m_pChannelHeader->nOriginalProcId = nSenderProcId;
     return RC::SUCCESS;
 }
 
 
 //
-RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32& nOutSize, T_MSG_ID& nOutMsgId, T_ID& nOutSenderProcId)
+RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32& nOutSize, T_MSG_ID& nOutMsgId, T_ID& nOutSenderProcId, T_UINT32& nOutFlags, T_UINT64& nOutCorrelationId)
 {
     if (!pSubRecord)
     {
@@ -1564,61 +2034,120 @@ RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32
     }
 
     T_UINT64 targetSeq = pSubRecord->LastReadSeq + 1;
-    TPRingSlot pSlot = GetSlot((T_UINT32)(targetSeq & RING_SLOT_MASK));
+    ChannelPolicy policy = m_pChannelHeader->nPolicy;
 
-    if (pSlot->nSequence < targetSeq)
+    // Check for POLICY_DROP_OLDEST lap / overrun
+    T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+    if (policy == ChannelPolicy::POLICY_DROP_OLDEST)
     {
-        for (T_UINT32 i = 0; i < 1000; i++)
+        if (currentWrite > pSubRecord->LastReadOffset + m_nLogBufferSize)
         {
-            T_CPU_PAUSE();
-            if (pSlot->nSequence >= targetSeq)
+            T_UINT64 oldestOffset = (currentWrite - m_nLogBufferSize + 127) & ~63;
+            for (T_UINT32 step = 0; step < 2048; step++)
             {
-                break;
+                T_UINT32 off = (T_UINT32)(oldestOffset & m_nLogBufferMask);
+                TPLogRecordHeader pCand = (TPLogRecordHeader)(m_pShmDataAddr + off);
+                if (pCand->nMagic == TELEPORT_MAGIC && pCand->nSequence > pSubRecord->LastReadSeq)
+                {
+                    if (!(pCand->nFlags & LOG_RECORD_FLAG_PADDING))
+                    {
+                        T_UINT64 dropped = pCand->nSequence - targetSeq;
+                        pSubRecord->DropCount += (T_UINT32)dropped;
+                        pSubRecord->LastReadOffset = oldestOffset;
+                        pSubRecord->LastReadSeq = pCand->nSequence - 1;
+                        targetSeq = pCand->nSequence;
+                        pSubRecord->Status = SUB_STATUS_DROPPED;
+                        break;
+                    }
+                }
+                oldestOffset += 64;
             }
         }
-        if (pSlot->nSequence < targetSeq)
+    }
+
+    T_UINT32 readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
+    TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
+
+    // Skip PADDING records
+    while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
+    {
+        pSubRecord->LastReadOffset += pRec->nRecordSize;
+        readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
+        pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
+    }
+
+    // Hybrid Adaptive Wait: Spin -> Yield
+    if (pRec->nSequence < targetSeq)
+    {
+        for (T_UINT32 i = 0; i < 500; i++)
+        {
+            T_CPU_PAUSE();
+            while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
+            {
+                pSubRecord->LastReadOffset += pRec->nRecordSize;
+                readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
+                pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
+            }
+            if (pRec->nSequence >= targetSeq) break;
+        }
+        if (pRec->nSequence < targetSeq)
         {
             for (T_UINT32 j = 0; j < 30; j++)
             {
                 T_THREAD_YIELD();
-                if (pSlot->nSequence >= targetSeq)
+                while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
                 {
-                    break;
+                    pSubRecord->LastReadOffset += pRec->nRecordSize;
+                    readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
+                    pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
                 }
+                if (pRec->nSequence >= targetSeq) break;
             }
         }
     }
 
-    if (pSlot->nSequence != targetSeq)
+    if (pRec->nSequence != targetSeq)
     {
         return RC::TIMEOUT;
     }
 
-    if (pSlot->nMagic != TELEPORT_MAGIC)
+    if (pRec->nMagic != TELEPORT_MAGIC)
     {
         LogError("CChannelData::ReadRingMsg: Magic corrupted on seq %llu", targetSeq);
         return RC::FAILED;
     }
 
-    if (pSlot->nLength > MAX_SLOT_DATA_SIZE)
+    if (pRec->nLength > MAX_LOG_MESSAGE_SIZE)
     {
-        LogError("CChannelData::ReadRingMsg: Slot data length exceed limit (%u) on seq %llu", pSlot->nLength, targetSeq);
+        LogError("CChannelData::ReadRingMsg: Slot data length exceed limit (%u) on seq %llu", pRec->nLength, targetSeq);
+        pSubRecord->LastReadOffset += pRec->nRecordSize;
+        pSubRecord->LastReadSeq = targetSeq;
         return RC::FAILED;
     }
 
-    T_UINT32 nCrc = TComputeCRC32((void*)pSlot->Data, pSlot->nLength);
-    if (nCrc != pSlot->nChecksum)
+    void* pPayload = (void*)(pRec + 1);
+    T_UINT32 nCrc = TComputeCRC32(pPayload, pRec->nLength);
+    if (nCrc != pRec->nChecksum)
     {
         LogError("CChannelData::ReadRingMsg: CRC mismatch on seq %llu", targetSeq);
+        pSubRecord->LastReadOffset += pRec->nRecordSize;
+        pSubRecord->LastReadSeq = targetSeq;
         return RC::FAILED;
     }
 
-    pOutData = (T_PVOID)pSlot->Data;
-    nOutSize = pSlot->nLength;
+    pOutData = pPayload;
+    nOutSize = pRec->nLength;
     nOutMsgId = targetSeq;
-    nOutSenderProcId = pSlot->nSenderProcId;
+    nOutSenderProcId = pRec->nSenderProcId;
+    nOutFlags = pRec->nFlags;
+    nOutCorrelationId = pRec->nCorrelationId;
+
+    pSubRecord->LastReadOffset += pRec->nRecordSize;
+    pSubRecord->LastReadSeq = targetSeq;
+
     return RC::SUCCESS;
 }
+
 
 
 //
@@ -1656,8 +2185,8 @@ RC CChannelData::Realloc(T_UINT32 nSizeInByte)
 //
 T_VOID CBFCrypto::BF_encrypt(BF_LONG* data, const BF_KEY* key)
 {
-    register BF_LONG l, r;
-    register const BF_LONG* p, * s;
+    BF_LONG l, r;
+    const BF_LONG* p, * s;
 
     p = key->P;
     s = &(key->S[0]);
@@ -1689,8 +2218,8 @@ T_VOID CBFCrypto::BF_encrypt(BF_LONG* data, const BF_KEY* key)
 
 T_VOID CBFCrypto::BF_decrypt(BF_LONG* data, const BF_KEY* key)
 {
-    register BF_LONG l, r;
-    register const BF_LONG* p, * s;
+    BF_LONG l, r;
+    const BF_LONG* p, * s;
 
     p = key->P;
     s = &(key->S[0]);
@@ -1729,9 +2258,9 @@ T_VOID CBFCrypto::BF_cfb64_encrypt(T_PCUCHAR in,
     T_PINT32 num,
     BF_ACTION eAction)
 {
-    register BF_LONG v0, v1, t;
-    register int n = *num;
-    register long l = length;
+    BF_LONG v0, v1, t;
+    int n = *num;
+    long l = length;
     BF_LONG ti[2];
     unsigned char* iv, c, cc;
 

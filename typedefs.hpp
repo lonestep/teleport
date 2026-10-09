@@ -8,6 +8,12 @@
 */
 #pragma once
 
+#if defined(_WIN32) || defined(__WIN32__) || defined(__MINGW32__)
+#ifndef Windows
+#define Windows 1
+#endif
+#endif
+
 #ifdef Windows
 #include <windows.h>
 #else
@@ -272,11 +278,23 @@ namespace TLP
 
 
     //
+    //
     enum class MsgType
     {
         MSG_PUB_PUT = 0,   // When message was put to shared memory
         MSG_PUB_ACK,       // When message has been acknowleged by remote process
-        MSG_SUB_GET        // When got message from the subscribed channel
+        MSG_SUB_GET,       // When got message from the subscribed channel
+        MSG_RPC_REQ,       // RPC Request message
+        MSG_RPC_RESP,      // RPC Response message
+        MSG_DROPPED        // Notification when message(s) were dropped
+    };
+
+    // Optimization 2: QoS & Flow Control Backpressure Policies
+    enum class ChannelPolicy : T_UINT32
+    {
+        POLICY_BLOCK = 0,               // Default: Block publishers when buffer full (Zero loss, strict FIFO)
+        POLICY_DROP_OLDEST = 1,          // Overwrite oldest unread messages when full (Real-time stream, skip lag)
+        POLICY_ISOLATE_SLOW_CONSUMER = 2 // Automatically isolate/evict slow consumers lagging beyond threshold
     };
 
 #define CH_LISTEN (1<<0)
@@ -296,39 +314,59 @@ namespace TLP
         ALL = CH_ALL                                   //All flag:Listen and send, create if not exist
     };
 
+#define LOG_RECORD_FLAG_DATA        0x0001
+#define LOG_RECORD_FLAG_PADDING     0x0002
+#define LOG_RECORD_FLAG_RPC_REQ     0x0004
+#define LOG_RECORD_FLAG_RPC_RESP    0x0008
+#define LOG_RECORD_FLAG_CORRUPT_CRC 0x0010
 
-    //
-    typedef struct alignas(64) _Ring_Slot
+#define SUB_STATUS_ACTIVE        0
+#define SUB_STATUS_ISOLATED      1
+#define SUB_STATUS_DROPPED       2
+
+#define MAX_LOG_MESSAGE_SIZE     (4 * 1024 * 1024) // 4 MB maximum message size (Aeron style)
+#define MAX_RPC_TOPIC_LEN        64
+
+    // Optimization 1: Scheme A - Compact Ring Record Header (Continuous Log Buffer)
+    typedef struct alignas(64) _Log_Record_Header
     {
         volatile T_UINT32 nMagic;        // TELEPORT_MAGIC
         volatile T_UINT32 nChecksum;     // CRC32 of payload
         volatile T_UINT64 nSequence;     // Monotonic global sequence (1, 2, 3...)
         volatile T_ID     nSenderProcId; // Process ID of sender
         volatile T_UINT32 nLength;       // Payload length
-        volatile T_UINT32 nFlags;        // Slot flags
-        volatile T_UINT32 nReserved;     // Padding/alignment
-        T_UINT8           Data[MAX_SLOT_DATA_SIZE]; // In-place payload
-        T_UINT8           SlotPad[32];   // Align total slot to 4160 bytes (65 cache lines)
-    }TRingSlot, * TPRingSlot;
+        volatile T_UINT32 nFlags;        // Record flags (DATA, PADDING, RPC_REQ, RPC_RESP)
+        volatile T_UINT32 nRecordSize;   // Total record size aligned to 64 bytes
+        volatile T_UINT64 nCorrelationId;// RPC correlation ID
+        T_UINT8           Reserved[24];  // Pad to 64 bytes (1 full cache line)
+    } TLogRecordHeader, * TPLogRecordHeader;
 
+    // Backward compatibility alias for TRingSlot
+    typedef TLogRecordHeader TRingSlot;
+    typedef TPLogRecordHeader TPRingSlot;
 
     // 64-byte aligned subscriber record (1 cache line per subscriber)
     typedef struct alignas(64) _Ack_Record
     {
         volatile T_ID        ProcId;
         volatile ACK_FLAG    AckFlag;
-        volatile T_UINT64    LastReadSeq;
+        volatile T_UINT64    LastReadSeq;    // Highest sequence read
+        volatile T_UINT64    LastReadOffset; // Monotonic byte cursor consumed in log buffer
         volatile T_UINT64    HeartbeatTick;
-        volatile T_UINT32    Status;
-        T_UINT8              Padding[36]; // Pad to 64 bytes
+        volatile T_UINT32    Status;         // SUB_STATUS_ACTIVE, SUB_STATUS_ISOLATED
+        volatile T_UINT32    DropCount;      // Number of dropped messages under POLICY_DROP_OLDEST
+        T_UINT8              Padding[24];    // Pad to 64 bytes
     }TAckRecord, * TPAckRecord;
 
 
     typedef struct alignas(64) _Publisher_Header
     {
-        volatile T_UINT64 WriteCursor;   // Next sequence to allocate
-        volatile T_UINT64 CommitCursor;  // Highest contiguous committed sequence
-        T_UINT8           Padding[48];   // Pad to 64 bytes
+        volatile T_UINT64 WriteCursor;   // Monotonic allocated byte cursor in log buffer
+        volatile T_UINT64 CommitCursor;  // Monotonic committed byte cursor in log buffer
+        volatile T_UINT64 WriteMsgSeq;   // Monotonic message sequence (1, 2, 3...)
+        volatile T_UINT64 CommitMsgSeq;  // Monotonic committed sequence
+        volatile T_LONG   SpinLock;      // Atomic spinlock for lockstep reservation
+        T_UINT8           Padding[28];   // Pad to 64 bytes
     }TPublisherHeader, * TPPublisherHeader;
 
 
@@ -341,16 +379,36 @@ namespace TLP
         volatile T_SHORT    nSubscribers;    // Active subscriber count
         volatile T_MSG_ID   nOriginalMsgId;  // Original message ID (compatibility)
         volatile T_ID       nOriginalProcId; // Original process ID (compatibility)
-        volatile T_UINT32   nSlotCount;      // RING_SLOT_COUNT
-        volatile T_UINT32   nSlotSize;       // sizeof(TRingSlot)
+        volatile T_UINT32   nBufferSize;     // Continuous Log buffer size (bytes)
+        volatile T_UINT32   nBufferMask;     // Log buffer mask (nBufferSize - 1)
         volatile T_LONG     nWaitingSubs;    // Subscribers currently sleeping on event
         volatile T_LONG     nWaitingPubs;    // Publishers currently sleeping on event
-        T_UINT8             HeaderPad[24];   // Pad to 64 bytes
+        volatile ChannelPolicy nPolicy;      // Channel policy (POLICY_BLOCK, etc.)
+        volatile T_UINT32   nLagThreshold;   // Threshold bytes for isolation
+        T_UINT8             HeaderPad[16];   // Pad to 64 bytes
 
         TPublisherHeader    PubHeader;       // 64 bytes cache line
 
         TAckRecord AckRecords[MAX_SUBSCRIBERS_PER_CHANNEL]; // 64 bytes each
     }TChannelShmHeader, * TPChannelShmHeader;
+
+
+    // Optimization 4: RPC Envelopes
+    typedef struct alignas(8) _Rpc_Envelope
+    {
+        T_UINT64 nCorrelationId;
+        T_CHAR   szReplyTopic[MAX_RPC_TOPIC_LEN];
+        T_UINT32 nBodyLength;
+        T_UINT32 nReserved;
+    } TRpcEnvelope, * TPRpcEnvelope;
+
+    typedef struct alignas(8) _Rpc_Response_Envelope
+    {
+        T_UINT64 nCorrelationId;
+        RC       nResult;
+        T_UINT32 nBodyLength;
+        T_UINT32 nReserved;
+    } TRpcResponseEnvelope, * TPRpcResponseEnvelope;
 
 
     //
@@ -399,6 +457,7 @@ namespace TLP
         T_UINT32    nLength;          // Data length (or 0 without data)
         T_MSG_ID    nOriginalMsgId;   // Original message id
         RC          eResult;          // RC::SUCCESS or RC::FAILED
+        T_UINT64    nCorrelationId;   // RPC correlation ID
 
     }TCbMessage, * PTCbMessage;
 

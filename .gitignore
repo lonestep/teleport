@@ -36,3 +36,4 @@ CMakeSettings.json
 # Logs
 TlpLog/
 benchmark_logs/
+__pycache__/

@@ -49,7 +49,7 @@ BaseNamedObject::BaseNamedObject(T_PCSTR pName) :
     {
         memset(m_strName, 0, MAX_NAME);
         strcpy_s(m_strName, MAX_NAME, pName);
-        T_PSTR pGlobal = GLOBAL_STR;
+        T_PCSTR pGlobal = GLOBAL_STR;
         m_bGlobal = !_strnicmp(m_strName, pGlobal, strlen(pGlobal));
     }
     else
@@ -650,22 +650,22 @@ T_PSTR Logger::TypeToString(LoggerType eType)
     switch (eType)
     {
     case LoggerType::LOG_VITAL:
-        pTypeStr = "VITAL";
+        pTypeStr = (T_PSTR)"VITAL";
         break;
     case LoggerType::LOG_ERROR:
-        pTypeStr = "ERROR";
+        pTypeStr = (T_PSTR)"ERROR";
         break;
     case LoggerType::LOG_WARNING:
-        pTypeStr = "WARNING";
+        pTypeStr = (T_PSTR)"WARNING";
         break;
     case LoggerType::LOG_INFO:
-        pTypeStr = "INFO";
+        pTypeStr = (T_PSTR)"INFO";
         break;
     case LoggerType::LOG_TRIVIAL:
-        pTypeStr = "TRIVIAL";
+        pTypeStr = (T_PSTR)"TRIVIAL";
         break;
     default:
-        pTypeStr = "UNKNOWN";
+        pTypeStr = (T_PSTR)"UNKNOWN";
     }
     return pTypeStr;
 }
