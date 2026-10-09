@@ -99,7 +99,7 @@ namespace TLP
 
 #else //*NIX OS
 
-    typedef int32_t           T_HANDLE;
+    typedef void*             T_HANDLE;
 #ifdef UNICODE
     typedef wchar_t           T_CHAR;
     typedef unsigned wchar_t  T_UCHAR;
@@ -139,8 +139,8 @@ namespace TLP
     typedef std::string       T_STRING;
 
 #define I64_FMT         "%lld"
-#define T_INVHDL        -1
-#define T_VALHDL        1
+#define T_INVHDL        ((T_HANDLE)(intptr_t)-1)
+#define T_VALHDL        ((T_HANDLE)(intptr_t)1)
 #define T_FALSE         false
 #define T_TRUE          true
 #define T_NULL          NULL
@@ -148,9 +148,8 @@ namespace TLP
 #define IS_FAILED(_x)   ((_x) != RC::SUCCESS)
 #define CHK_RC(_rc)     {if(IS_FAILED(_rc)){LogError("%s(line %d) rc:%d", __FILE__, __LINE__, _rc);return _rc;}}
 #define SAFE_CLOSE_HANDLE(_h)        \
-    {if (_h != T_INVHDL)             \
+    {if (_h != T_INVHDL && _h != T_NULL) \
     {                                \
-        close(_h);             \
         _h = T_INVHDL;               \
     }}
 

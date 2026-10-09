@@ -33,6 +33,12 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
+#include <semaphore.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
 #endif
 
 // Fast CPU Pause and Thread Yield Primitives
@@ -185,7 +191,7 @@ namespace TLP
     {
     public:
         NamedEvent(T_PCSTR pName);
-        virtual ~NamedEvent() {}
+        virtual ~NamedEvent();
     };
 
 
@@ -194,7 +200,7 @@ namespace TLP
     {
     public:
         NamedMutex(T_PCSTR pName);
-        virtual ~NamedMutex() {}
+        virtual ~NamedMutex();
     };
 
     

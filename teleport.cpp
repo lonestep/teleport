@@ -1126,10 +1126,14 @@ RC CChannel::RunPubThread()
         }
         else
         {
+#ifdef Windows
             if (WAIT_OBJECT_0 == WaitForSingleObject(m_hStopEvent, PUB_MSG_INTERVAL))
             {
                 break;
             }
+#else
+            TSleep(PUB_MSG_INTERVAL);
+#endif
         }
     }
     LogInfo("Channel %s(#%d) RunPubThread() exit.", m_strChannelName.c_str(), (T_UINT32)m_nChannelId);
@@ -1210,7 +1214,7 @@ RC CChannel::RunSubThread()
 #endif
             T_UINT64 targetSeq = m_pAckRecord->LastReadSeq + 1;
             TPLogRecordHeader pRec = m_pChannelData->GetRecordHeader(m_pAckRecord->LastReadOffset);
-            if (pRec->nSequence != targetSeq && !m_bStopped)
+            if (!(pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nSequence != targetSeq && !m_bStopped)
             {
                 m_pEventSubRead->Wait(1);
             }
@@ -1335,7 +1339,8 @@ CChannelData::CChannelData(T_PCSTR pChannelObjName, T_UINT32 nShmSizeInByte, Cha
     m_pShmDataAddr(T_NULL),
     m_nDataOffset(0),
     m_nLogBufferSize(0),
-    m_nLogBufferMask(0)
+    m_nLogBufferMask(0),
+    m_cachedMinOffset(0)
 {
     if (nShmSizeInByte < DEFAULT_SHM_SIZE)
     {
@@ -1409,7 +1414,8 @@ CChannelData::CChannelData():
     m_pShmDataAddr(T_NULL),
     m_nDataOffset(0),
     m_nLogBufferSize(0),
-    m_nLogBufferMask(0)
+    m_nLogBufferMask(0),
+    m_cachedMinOffset(0)
 {
     m_nDataOffset = (sizeof(TChannelShmHeader) + 4095) & ~4095;
 }
@@ -1757,48 +1763,69 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
 
     ChannelPolicy policy = m_pChannelHeader->nPolicy;
 
-    // Allocate in Continuous Log Buffer under spinlock for strictly ordered (writeStart, nextSeq)
+    // Allocate in Continuous Log Buffer under ultra-lean TTAS spinlock for strictly ordered (writeStart, nextSeq)
     T_UINT64 writeStart = 0;
     T_UINT64 nextSeq = 0;
     T_UINT32 nSpin = 0;
     while (true)
     {
+        // 1. Backpressure throttling check OUTSIDE the spinlock using cachedMinOffset
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        if (policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER)
+        {
+            if (currentWrite + (m_nLogBufferSize >> 2) > m_cachedMinOffset + m_nLogBufferSize)
+            {
+                m_cachedMinOffset = GetMinSubscriberOffset();
+            }
+            if (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize)
+            {
+                if (++nSpin < 500)
+                {
+                    T_CPU_PAUSE();
+                }
+                else if (nSpin < 550)
+                {
+                    T_THREAD_YIELD();
+                }
+                else
+                {
+                    CleanZombieSubscribers();
+                    m_cachedMinOffset = GetMinSubscriberOffset();
+                    TSleep(1);
+                }
+                continue;
+            }
+        }
+
+        // 2. Ultra-lean TTAS spinlock
 #ifdef Windows
-        while (InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
+        while (m_pChannelHeader->PubHeader.SpinLock != 0 ||
+               InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
         {
             T_CPU_PAUSE();
         }
 #else
-        while (!__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
+        while (m_pChannelHeader->PubHeader.SpinLock != 0 ||
+               !__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
         {
             T_CPU_PAUSE();
         }
 #endif
 
-        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
-        T_UINT64 minOffset = GetMinSubscriberOffset();
+        currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
         if ((policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER) &&
-            (currentWrite + nRecordSize > minOffset + m_nLogBufferSize))
+            (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize))
         {
+            m_cachedMinOffset = GetMinSubscriberOffset();
+            if (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize)
+            {
 #ifdef Windows
-            InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+                InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
 #else
-            __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+                __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
 #endif
-            if (++nSpin < 500)
-            {
-                T_CPU_PAUSE();
+                continue;
             }
-            else if (nSpin < 550)
-            {
-                T_THREAD_YIELD();
-            }
-            else
-            {
-                CleanZombieSubscribers();
-                TSleep(1);
-            }
-            continue;
         }
 
         T_UINT32 offset = (T_UINT32)(currentWrite & m_nLogBufferMask);
@@ -1807,6 +1834,7 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
         if (remaining < nRecordSize)
         {
             T_UINT32 paddingSize = remaining;
+            T_UINT64 padSeq = ++m_pChannelHeader->PubHeader.WriteMsgSeq;
             TPLogRecordHeader pPad = (TPLogRecordHeader)(m_pShmDataAddr + offset);
             pPad->nMagic = 0;
             pPad->nSequence = 0;
@@ -1822,6 +1850,7 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
             __sync_synchronize();
 #endif
             pPad->nMagic = TELEPORT_MAGIC;
+            pPad->nSequence = padSeq;
 
             currentWrite += paddingSize;
         }
@@ -1840,8 +1869,6 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
 
     T_UINT32 recordOffset = (T_UINT32)(writeStart & m_nLogBufferMask);
     TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + recordOffset);
-    pRec->nMagic = 0;
-    pRec->nSequence = 0;
 
     void* pPayload = (void*)(pRec + 1);
     if (pData && nSizeInByte > 0)
@@ -1864,15 +1891,7 @@ RC CChannelData::WriteRingMsg(T_PCVOID pData, T_UINT32 nSizeInByte, T_MSG_ID& nO
 #endif
     pRec->nSequence = nextSeq;
 
-#ifdef Windows
-    InterlockedCompareExchange64((LONG64*)&m_pChannelHeader->PubHeader.CommitCursor, (LONG64)(writeStart + nRecordSize), (LONG64)writeStart);
-#else
-    __sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.CommitCursor, writeStart, writeStart + nRecordSize);
-#endif
-
     nOutMsgId = nextSeq;
-    m_pChannelHeader->nOriginalMsgId = nextSeq;
-    m_pChannelHeader->nOriginalProcId = nSenderProcId;
     return RC::SUCCESS;
 }
 
@@ -1897,42 +1916,63 @@ RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UIN
     T_UINT32 nSpin = 0;
     while (true)
     {
+        // 1. Backpressure throttling check OUTSIDE the spinlock using cachedMinOffset
+        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
+        if (policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER)
+        {
+            if (currentWrite + (m_nLogBufferSize >> 2) > m_cachedMinOffset + m_nLogBufferSize)
+            {
+                m_cachedMinOffset = GetMinSubscriberOffset();
+            }
+            if (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize)
+            {
+                if (++nSpin < 500)
+                {
+                    T_CPU_PAUSE();
+                }
+                else if (nSpin < 550)
+                {
+                    T_THREAD_YIELD();
+                }
+                else
+                {
+                    CleanZombieSubscribers();
+                    m_cachedMinOffset = GetMinSubscriberOffset();
+                    TSleep(1);
+                }
+                continue;
+            }
+        }
+
+        // 2. Ultra-lean TTAS spinlock
 #ifdef Windows
-        while (InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
+        while (m_pChannelHeader->PubHeader.SpinLock != 0 ||
+               InterlockedCompareExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 1, 0) != 0)
         {
             T_CPU_PAUSE();
         }
 #else
-        while (!__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
+        while (m_pChannelHeader->PubHeader.SpinLock != 0 ||
+               !__sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.SpinLock, 0, 1))
         {
             T_CPU_PAUSE();
         }
 #endif
 
-        T_UINT64 currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
-        T_UINT64 minOffset = GetMinSubscriberOffset();
+        currentWrite = m_pChannelHeader->PubHeader.WriteCursor;
         if ((policy == ChannelPolicy::POLICY_BLOCK || policy == ChannelPolicy::POLICY_ISOLATE_SLOW_CONSUMER) &&
-            (currentWrite + nRecordSize > minOffset + m_nLogBufferSize))
+            (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize))
         {
+            m_cachedMinOffset = GetMinSubscriberOffset();
+            if (currentWrite + nRecordSize > m_cachedMinOffset + m_nLogBufferSize)
+            {
 #ifdef Windows
-            InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
+                InterlockedExchange((LONG*)&m_pChannelHeader->PubHeader.SpinLock, 0);
 #else
-            __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
+                __sync_lock_release(&m_pChannelHeader->PubHeader.SpinLock);
 #endif
-            if (++nSpin < 500)
-            {
-                T_CPU_PAUSE();
+                continue;
             }
-            else if (nSpin < 550)
-            {
-                T_THREAD_YIELD();
-            }
-            else
-            {
-                CleanZombieSubscribers();
-                TSleep(1);
-            }
-            continue;
         }
 
         T_UINT32 offset = (T_UINT32)(currentWrite & m_nLogBufferMask);
@@ -1941,6 +1981,7 @@ RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UIN
         if (remaining < nRecordSize)
         {
             T_UINT32 paddingSize = remaining;
+            T_UINT64 padSeq = ++m_pChannelHeader->PubHeader.WriteMsgSeq;
             TPLogRecordHeader pPad = (TPLogRecordHeader)(m_pShmDataAddr + offset);
             pPad->nMagic = 0;
             pPad->nSequence = 0;
@@ -1956,6 +1997,7 @@ RC CChannelData::AcquireRingBuffer(T_UINT32 nSizeInByte, T_PVOID& pBuffer, T_UIN
             __sync_synchronize();
 #endif
             pPad->nMagic = TELEPORT_MAGIC;
+            pPad->nSequence = padSeq;
 
             currentWrite += paddingSize;
         }
@@ -2012,15 +2054,7 @@ RC CChannelData::CommitRingBuffer(T_UINT64 nToken, T_UINT32 nSizeInByte, T_ID nS
 #endif
     T_UINT64 nextSeq = pRec->nSequence;
 
-#ifdef Windows
-    InterlockedCompareExchange64((LONG64*)&m_pChannelHeader->PubHeader.CommitCursor, (LONG64)(nToken + pRec->nRecordSize), (LONG64)nToken);
-#else
-    __sync_bool_compare_and_swap(&m_pChannelHeader->PubHeader.CommitCursor, nToken, nToken + pRec->nRecordSize);
-#endif
-
     nOutMsgId = nextSeq;
-    m_pChannelHeader->nOriginalMsgId = nextSeq;
-    m_pChannelHeader->nOriginalProcId = nSenderProcId;
     return RC::SUCCESS;
 }
 
@@ -2068,9 +2102,11 @@ RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32
     T_UINT32 readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
     TPLogRecordHeader pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
 
-    // Skip PADDING records
-    while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
+    // Skip valid PADDING records for current stream (prevent stale padding from earlier lap)
+    while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC && pRec->nSequence >= targetSeq)
     {
+        targetSeq = pRec->nSequence + 1;
+        pSubRecord->LastReadSeq = pRec->nSequence;
         pSubRecord->LastReadOffset += pRec->nRecordSize;
         readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
         pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
@@ -2079,11 +2115,13 @@ RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32
     // Hybrid Adaptive Wait: Spin -> Yield
     if (pRec->nSequence < targetSeq)
     {
-        for (T_UINT32 i = 0; i < 500; i++)
+        for (T_UINT32 i = 0; i < 1000; i++)
         {
             T_CPU_PAUSE();
-            while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
+            while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC && pRec->nSequence >= targetSeq)
             {
+                targetSeq = pRec->nSequence + 1;
+                pSubRecord->LastReadSeq = pRec->nSequence;
                 pSubRecord->LastReadOffset += pRec->nRecordSize;
                 readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
                 pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);
@@ -2092,11 +2130,13 @@ RC CChannelData::ReadRingMsg(TPAckRecord pSubRecord, T_PVOID& pOutData, T_UINT32
         }
         if (pRec->nSequence < targetSeq)
         {
-            for (T_UINT32 j = 0; j < 30; j++)
+            for (T_UINT32 j = 0; j < 50; j++)
             {
                 T_THREAD_YIELD();
-                while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC)
+                while ((pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nMagic == TELEPORT_MAGIC && pRec->nSequence >= targetSeq)
                 {
+                    targetSeq = pRec->nSequence + 1;
+                    pSubRecord->LastReadSeq = pRec->nSequence;
                     pSubRecord->LastReadOffset += pRec->nRecordSize;
                     readOffset = (T_UINT32)(pSubRecord->LastReadOffset & m_nLogBufferMask);
                     pRec = (TPLogRecordHeader)(m_pShmDataAddr + readOffset);

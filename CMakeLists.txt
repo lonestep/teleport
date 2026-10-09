@@ -10,6 +10,8 @@ add_executable (teleport "teleport.cpp" "teleport.hpp" "platform.cpp" "platform.
 
 if (WIN32 OR MINGW)
     target_link_libraries(teleport ws2_32 shlwapi ole32)
+elseif (UNIX AND NOT APPLE)
+    target_link_libraries(teleport pthread rt)
 endif()
 
 

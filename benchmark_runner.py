@@ -6,116 +6,257 @@ import subprocess
 import threading
 import json
 import re
+import tempfile
+import platform
 
-LOG_DIR = "/tmp/teleport_bench_logs"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.environ.get("LOG_DIR") or (
+    os.path.join(tempfile.gettempdir(), "teleport_bench_logs")
+    if sys.platform == "win32"
+    else "/tmp/teleport_bench_logs"
+)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 def get_system_specs():
     specs = {}
-    # OS & Kernel
-    try:
-        specs["kernel"] = subprocess.check_output(["uname", "-r"]).decode().strip()
-        specs["os"] = subprocess.check_output(["uname", "-s", "-v", "-m"]).decode().strip()
-    except Exception as e:
-        specs["kernel"] = str(e)
-    
-    # CPU
-    try:
-        lscpu = subprocess.check_output(["lscpu"]).decode()
-        for line in lscpu.splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                k = k.strip()
-                v = v.strip()
-                if k == "Model name":
-                    specs["cpu_model"] = v
-                elif k == "CPU(s)":
-                    specs["cpu_count"] = v
-                elif k == "Thread(s) per core":
-                    specs["threads_per_core"] = v
-                elif k == "Core(s) per socket":
-                    specs["cores_per_socket"] = v
-                elif k == "Socket(s)":
-                    specs["sockets"] = v
-                elif k == "CPU max MHz":
-                    specs["cpu_max_mhz"] = v
-                elif k == "L1d cache":
-                    specs["l1d_cache"] = v
-                elif k == "L1i cache":
-                    specs["l1i_cache"] = v
-                elif k == "L2 cache":
-                    specs["l2_cache"] = v
-                elif k == "L3 cache":
-                    specs["l3_cache"] = v
-    except Exception as e:
-        specs["cpu_error"] = str(e)
+    if sys.platform == "win32":
+        # Windows OS & Kernel
+        specs["kernel"] = platform.version()
+        specs["os"] = f"{platform.system()} {platform.release()} ({platform.architecture()[0]})"
+        specs["cpu_model"] = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "Unknown")
+        specs["cpu_count"] = str(os.cpu_count() or 1)
+        specs["cores_per_socket"] = str(os.cpu_count() or 1)
+        
+        # Query PowerShell for CPU details if possible
+        try:
+            ps_cmd = "Get-CimInstance Win32_Processor | Select-Object -Property Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json"
+            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_cmd], stderr=subprocess.DEVNULL).decode()
+            pdata = json.loads(out)
+            if isinstance(pdata, list): 
+                pdata = pdata[0]
+            specs["cpu_model"] = pdata.get("Name", specs["cpu_model"])
+            specs["cores_per_socket"] = str(pdata.get("NumberOfCores", specs["cores_per_socket"]))
+            specs["cpu_count"] = str(pdata.get("NumberOfLogicalProcessors", specs["cpu_count"]))
+        except Exception:
+            pass
 
-    # Memory
-    try:
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    k = parts[0].strip()
-                    val = parts[1].strip().split()[0]
-                    if k == "MemTotal":
-                        specs["mem_total_kb"] = int(val)
-                    elif k == "MemAvailable":
-                        specs["mem_avail_kb"] = int(val)
-                    elif k == "SwapTotal":
-                        specs["swap_total_kb"] = int(val)
-                    elif k == "SwapFree":
-                        specs["swap_free_kb"] = int(val)
-    except Exception as e:
-        specs["mem_error"] = str(e)
+        # Query Windows Physical Memory via ctypes GlobalMemoryStatusEx
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            specs["mem_total_kb"] = int(stat.ullTotalPhys / 1024)
+            specs["mem_avail_kb"] = int(stat.ullAvailPhys / 1024)
+        except Exception as e:
+            specs["mem_error"] = str(e)
+
+    else:
+        # Linux OS & Kernel
+        try:
+            specs["kernel"] = subprocess.check_output(["uname", "-r"]).decode().strip()
+            specs["os"] = subprocess.check_output(["uname", "-s", "-v", "-m"]).decode().strip()
+        except Exception as e:
+            specs["kernel"] = str(e)
+        
+        # CPU
+        try:
+            lscpu = subprocess.check_output(["lscpu"]).decode()
+            for line in lscpu.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k == "Model name":
+                        specs["cpu_model"] = v
+                    elif k == "CPU(s)":
+                        specs["cpu_count"] = v
+                    elif k == "Thread(s) per core":
+                        specs["threads_per_core"] = v
+                    elif k == "Core(s) per socket":
+                        specs["cores_per_socket"] = v
+                    elif k == "Socket(s)":
+                        specs["sockets"] = v
+                    elif k == "CPU max MHz":
+                        specs["cpu_max_mhz"] = v
+                    elif k == "L1d cache":
+                        specs["l1d_cache"] = v
+                    elif k == "L1i cache":
+                        specs["l1i_cache"] = v
+                    elif k == "L2 cache":
+                        specs["l2_cache"] = v
+                    elif k == "L3 cache":
+                        specs["l3_cache"] = v
+        except Exception as e:
+            specs["cpu_error"] = str(e)
+
+        # Memory
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        k = parts[0].strip()
+                        val = parts[1].strip().split()[0]
+                        if k == "MemTotal":
+                            specs["mem_total_kb"] = int(val)
+                        elif k == "MemAvailable":
+                            specs["mem_avail_kb"] = int(val)
+                        elif k == "SwapTotal":
+                            specs["swap_total_kb"] = int(val)
+                        elif k == "SwapFree":
+                            specs["swap_free_kb"] = int(val)
+        except Exception as e:
+            specs["mem_error"] = str(e)
 
     return specs
 
 def read_cpu_ticks():
-    with open("/proc/stat", "r") as f:
-        line = f.readline()
-        parts = [float(x) for x in line.strip().split()[1:]]
-        # user, nice, system, idle, iowait, irq, softirq, steal
-        idle = parts[3] + parts[4]
-        total = sum(parts)
-        return total, idle
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+            idle_ft, kernel_ft, user_ft = FILETIME(), FILETIME(), FILETIME()
+            if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle_ft), ctypes.byref(kernel_ft), ctypes.byref(user_ft)):
+                def ft_to_int(ft):
+                    return (ft.dwHighDateTime << 32) + ft.dwLowDateTime
+                idle = float(ft_to_int(idle_ft))
+                kernel = float(ft_to_int(kernel_ft))
+                user = float(ft_to_int(user_ft))
+                total = kernel + user
+                return total, idle
+        except Exception:
+            pass
+        return 0.0, 0.0
+    else:
+        with open("/proc/stat", "r") as f:
+            line = f.readline()
+            parts = [float(x) for x in line.strip().split()[1:]]
+            # user, nice, system, idle, iowait, irq, softirq, steal
+            idle = parts[3] + parts[4]
+            total = sum(parts)
+            return total, idle
 
 def read_mem_info():
-    mem = {}
-    with open("/proc/meminfo", "r") as f:
-        for line in f:
-            parts = line.split(":")
-            if len(parts) == 2:
-                mem[parts[0].strip()] = int(parts[1].strip().split()[0])
-    total = mem.get("MemTotal", 0) / 1024.0  # MB
-    avail = mem.get("MemAvailable", 0) / 1024.0  # MB
-    used = total - avail
-    return total, used, (used / total * 100.0 if total > 0 else 0)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            total_mb = stat.ullTotalPhys / (1024.0 * 1024.0)
+            avail_mb = stat.ullAvailPhys / (1024.0 * 1024.0)
+            used_mb = total_mb - avail_mb
+            pct = (used_mb / total_mb * 100.0) if total_mb > 0 else 0
+            return total_mb, used_mb, pct
+        except Exception:
+            return 0.0, 0.0, 0.0
+    else:
+        mem = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+        total = mem.get("MemTotal", 0) / 1024.0  # MB
+        avail = mem.get("MemAvailable", 0) / 1024.0  # MB
+        used = total - avail
+        return total, used, (used / total * 100.0 if total > 0 else 0)
 
 def read_teleport_process_stats():
-    total_rss = 0.0
-    total_vsz = 0.0
-    total_ticks = 0
-    proc_count = 0
-    for pid in os.listdir("/proc"):
-        if pid.isdigit():
-            try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmd = f.read().decode("utf-8", errors="ignore")
-                    if "teleport" in cmd or "wine" in cmd:
-                        proc_count += 1
-                        with open(f"/proc/{pid}/stat", "r") as sf:
-                            s = sf.read().split()
-                            utime = int(s[13])
-                            stime = int(s[14])
-                            vsz = int(s[22]) / (1024.0 * 1024.0)
-                            rss = int(s[23]) * 4096.0 / (1024.0 * 1024.0)
-                            total_ticks += (utime + stime)
-                            total_vsz += vsz
-                            total_rss += rss
-            except:
-                pass
-    return proc_count, total_ticks, total_rss, total_vsz
+    if sys.platform == "win32":
+        # 1. Try psutil if installed
+        try:
+            import psutil
+            total_rss = 0.0
+            total_vsz = 0.0
+            total_ticks = 0
+            proc_count = 0
+            for p in psutil.process_iter(['name', 'cpu_times', 'memory_info']):
+                name = (p.info['name'] or '').lower()
+                if 'teleport' in name:
+                    proc_count += 1
+                    mem = p.info['memory_info']
+                    if mem:
+                        total_rss += mem.rss / (1024.0 * 1024.0)
+                        total_vsz += mem.vms / (1024.0 * 1024.0)
+                    cpu = p.info['cpu_times']
+                    if cpu:
+                        total_ticks += int((cpu.user + cpu.system) * 1000)
+            return proc_count, total_ticks, total_rss, total_vsz
+        except ImportError:
+            pass
+
+        # 2. Native tasklist fallback on Windows
+        try:
+            out = subprocess.check_output(
+                ['tasklist', '/FI', 'IMAGENAME eq teleport.exe', '/FO', 'CSV', '/NH'],
+                stderr=subprocess.DEVNULL
+            ).decode('utf-8', errors='ignore')
+            lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+            proc_count = 0
+            total_rss = 0.0
+            for line in lines:
+                if 'teleport.exe' in line.lower():
+                    proc_count += 1
+                    parts = [p.strip('"\r\n ') for p in line.split(',')]
+                    if len(parts) >= 5:
+                        mem_str = parts[4].replace(' K', '').replace(' KB', '').replace(',', '').replace(' ', '')
+                        if mem_str.isdigit():
+                            total_rss += float(mem_str) / 1024.0
+            return proc_count, int(time.time() * 1000), total_rss, total_rss * 1.5
+        except Exception:
+            return 0, 0, 0.0, 0.0
+
+    else:
+        total_rss = 0.0
+        total_vsz = 0.0
+        total_ticks = 0
+        proc_count = 0
+        for pid in os.listdir("/proc"):
+            if pid.isdigit():
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().decode("utf-8", errors="ignore")
+                        if "teleport" in cmd or "wine" in cmd:
+                            proc_count += 1
+                            with open(f"/proc/{pid}/stat", "r") as sf:
+                                s = sf.read().split()
+                                utime = int(s[13])
+                                stime = int(s[14])
+                                vsz = int(s[22]) / (1024.0 * 1024.0)
+                                rss = int(s[23]) * 4096.0 / (1024.0 * 1024.0)
+                                total_ticks += (utime + stime)
+                                total_vsz += vsz
+                                total_rss += rss
+                except:
+                    pass
+        return proc_count, total_ticks, total_rss, total_vsz
 
 class ResourceMonitor(threading.Thread):
     def __init__(self, interval_sec=0.05):
@@ -129,7 +270,6 @@ class ResourceMonitor(threading.Thread):
         self.start_time = time.time()
         prev_sys_total, prev_sys_idle = read_cpu_ticks()
         prev_proc_count, prev_proc_ticks, _, _ = read_teleport_process_stats()
-        prev_ts = self.start_time
 
         while self.running:
             time.sleep(self.interval)
@@ -147,11 +287,9 @@ class ResourceMonitor(threading.Thread):
             # Teleport process stats
             proc_count, proc_ticks, rss_mb, vsz_mb = read_teleport_process_stats()
             delta_proc_ticks = proc_ticks - prev_proc_ticks
-            # System has N CPUs
             num_cpus = os.cpu_count() or 1
             proc_cpu_pct = 0.0
-            if delta_total > 0:
-                # delta_proc_ticks is in jiffies, delta_total is in jiffies
+            if delta_total > 0 and delta_proc_ticks > 0:
                 proc_cpu_pct = max(0.0, (delta_proc_ticks / delta_total) * 100.0 * num_cpus)
 
             # Memory
@@ -170,7 +308,6 @@ class ResourceMonitor(threading.Thread):
 
             prev_sys_total, prev_sys_idle = sys_total, sys_idle
             prev_proc_ticks = proc_ticks
-            prev_ts = now
 
     def stop(self):
         self.running = False
@@ -217,6 +354,7 @@ def main():
     print(" Teleport High-Concurrency Multi-Process Benchmark")
     print(" Architecture: 4 Receivers (Subscribers), 12 Senders (Publishers)")
     print(" Workload:     20,000,000 Messages Sent | 80,000,000 Deliveries Expected")
+    print(" Platform:     " + ("Windows Native" if sys.platform == "win32" else "Linux / POSIX"))
     print("==================================================================")
     
     specs = get_system_specs()
@@ -224,7 +362,8 @@ def main():
     print(f"  OS / Kernel:     {specs.get('kernel', 'Unknown')} ({specs.get('os', 'Unknown')})")
     print(f"  CPU Model:       {specs.get('cpu_model', 'Unknown')}")
     print(f"  Cores / Threads: {specs.get('cores_per_socket', '?')} cores / {specs.get('cpu_count', '?')} logical CPUs (Max: {specs.get('cpu_max_mhz', '?')} MHz)")
-    print(f"  CPU Caches:      L1d: {specs.get('l1d_cache', '?')} | L1i: {specs.get('l1i_cache', '?')} | L2: {specs.get('l2_cache', '?')} | L3: {specs.get('l3_cache', '?')}")
+    if "l1d_cache" in specs:
+        print(f"  CPU Caches:      L1d: {specs.get('l1d_cache', '?')} | L1i: {specs.get('l1i_cache', '?')} | L2: {specs.get('l2_cache', '?')} | L3: {specs.get('l3_cache', '?')}")
     mem_total_gb = specs.get('mem_total_kb', 0) / (1024.0 * 1024.0)
     mem_avail_gb = specs.get('mem_avail_kb', 0) / (1024.0 * 1024.0)
     print(f"  Total Memory:    {mem_total_gb:.2f} GB (Available: {mem_avail_gb:.2f} GB)")
@@ -234,18 +373,31 @@ def main():
     monitor.start()
 
     print("\n[Benchmark Execution]")
-    print("Launching containerized multi-process suite...")
     t0 = time.time()
     
-    cmd = [
-        "podman", "run", "--rm",
-        "-v", "/home/shawn/src/teleport:/src:z",
-        "-v", "/tmp/teleport_bench_logs:/tmp/teleport_bench_logs:z",
-        "-w", "/src",
-        "teleport-env",
-        "sh", "/src/run_mp_benchmark.sh"
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    if sys.platform == "win32":
+        bat_script = os.path.join(SCRIPT_DIR, "run_mp_benchmark.bat")
+        print(f"Launching Windows native batch script: {bat_script}")
+        cmd = ["cmd.exe", "/c", bat_script]
+        proc = subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    else:
+        # Check container mode flag or default to container if native teleport binary not in path
+        has_native = os.path.exists(os.path.join(SCRIPT_DIR, "teleport")) or os.path.exists(os.path.join(SCRIPT_DIR, "teleport_linux")) or bool(os.environ.get("TELEPORT_BIN"))
+        use_container = any(arg in sys.argv for arg in ["--container", "--docker", "--podman"]) or not has_native
+        if use_container:
+            print("Launching containerized multi-process suite...")
+            cmd = [
+                "podman", "run", "--rm",
+                "-v", f"{SCRIPT_DIR}:/src:z",
+                "-v", f"{LOG_DIR}:{LOG_DIR}:z",
+                "-w", "/src",
+                "teleport-env",
+                "sh", "/src/run_mp_benchmark.sh"
+            ]
+        else:
+            print("Launching native Linux multi-process suite...")
+            cmd = ["sh", os.path.join(SCRIPT_DIR, "run_mp_benchmark.sh")]
+        proc = subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     
     for line in proc.stdout:
         print("  " + line.strip())
@@ -269,7 +421,7 @@ def main():
         log_path = os.path.join(LOG_DIR, f"receiver_{i}.log")
         rec_info = {"id": i, "received": 0, "lost": 0, "order_errors": 0, "elapsed_ms": 0, "rate": 0}
         if os.path.exists(log_path):
-            with open(log_path, "r") as f:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 m_recv = re.search(r"Total Messages Received:\s+(\d+)", content)
                 m_lost = re.search(r"Total Messages Lost:\s+(\d+)", content)
@@ -295,7 +447,7 @@ def main():
         log_path = os.path.join(LOG_DIR, f"sender_{i}.log")
         send_info = {"id": i, "sent": 0, "elapsed_ms": 0, "rate": 0}
         if os.path.exists(log_path):
-            with open(log_path, "r") as f:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 m_sent = re.search(r"complete:\s+(\d+)\s+msgs\s+in\s+(\d+)\s+ms\s+\(([\d\.]+)\s+msg/s\)", content)
                 if m_sent:
@@ -332,7 +484,8 @@ def main():
         "monitoring": monitor.records
     }
 
-    with open("/home/shawn/src/teleport/benchmark_results.json", "w") as f:
+    out_json = os.path.join(SCRIPT_DIR, "benchmark_results.json")
+    with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
     print("\n" + "=" * 66)
@@ -350,15 +503,13 @@ def main():
 
     # Print curves
     if monitor.records:
-        times = [r["time"] for r in monitor.records]
         sys_cpu = [r["sys_cpu_pct"] for r in monitor.records]
         proc_rss = [r["teleport_rss_mb"] for r in monitor.records]
-        sys_mem = [r["mem_used_mb"] for r in monitor.records]
 
         print("\n--- System CPU Utilization Curve (%) Over Time ---")
         print(render_ascii_chart(sys_cpu, width=60, height=8, unit="%"))
 
-        print("\n--- Teleport / Wine RSS Memory Curve (MB) Over Time ---")
+        print("\n--- Teleport RSS Memory Curve (MB) Over Time ---")
         print(render_ascii_chart(proc_rss, width=60, height=8, unit="M"))
 
         # Print table
@@ -380,7 +531,7 @@ def main():
             avg_rss = rss / pcount
             print(f"| {t:>6.2f}s  | {scpu:>12.1f}% | {cores:>14.2f} 核 | {rss:>12.1f} MB | {avg_rss:>10.1f} MB | {pcount:>5d} |")
 
-    print("\nBenchmark raw results exported to: /home/shawn/src/teleport/benchmark_results.json")
+    print(f"\nBenchmark raw results exported to: {out_json}")
 
 if __name__ == "__main__":
     main()

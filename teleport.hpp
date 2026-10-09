@@ -94,6 +94,7 @@ namespace TLP
         NamedMutex*          m_pChannelHdrMutex;
         NamedMutex*          m_pChannelDataMutex;
         T_PSTR               m_pShmDataAddr;
+        volatile T_UINT64    m_cachedMinOffset;
     };
 
 

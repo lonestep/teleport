@@ -1,12 +1,13 @@
 /**
-*    File:         platform.hpp
+*    File:         platform.cpp
 *
-*    Desc:
+*    Desc:         Cross-platform system abstraction layer (Windows & Linux POSIX)
 *
 *    Author:     lonestep@gmail.com
 *    Created:
 */
 #include "platform.hpp"
+#include <cstddef>
 
 using namespace TLP;
 
@@ -14,7 +15,7 @@ using namespace TLP;
 //
 T_BOOL BaseObject::IsValid()
 {
-    return T_BOOL(m_hHandle != T_INVHDL);
+    return T_BOOL(m_hHandle != T_INVHDL && m_hHandle != T_NULL);
 }
 
 
@@ -35,7 +36,11 @@ BaseObject::BaseObject():
 //
 BaseObject::~BaseObject()
 {
+#ifdef Windows
     SAFE_CLOSE_HANDLE(m_hHandle);
+#else
+    m_hHandle = T_INVHDL;
+#endif
 }
 
 
@@ -48,9 +53,15 @@ BaseNamedObject::BaseNamedObject(T_PCSTR pName) :
     if (T_NULL != pName)
     {
         memset(m_strName, 0, MAX_NAME);
+#ifdef Windows
         strcpy_s(m_strName, MAX_NAME, pName);
         T_PCSTR pGlobal = GLOBAL_STR;
         m_bGlobal = !_strnicmp(m_strName, pGlobal, strlen(pGlobal));
+#else
+        strncpy(m_strName, pName, MAX_NAME - 1);
+        T_PCSTR pGlobal = GLOBAL_STR;
+        m_bGlobal = !strncasecmp(m_strName, pGlobal, strlen(pGlobal));
+#endif
     }
     else
     {
@@ -65,6 +76,7 @@ BaseNamedObject::~BaseNamedObject()
 }
 
 
+#ifdef Windows
 //WINDOWS SPECIFIC
 BOOL SetPrivilege(
     HANDLE hToken,          // access token handle
@@ -104,7 +116,6 @@ BOOL SetPrivilege(
     }
 
     if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
-
     {
         return FALSE;
     }
@@ -131,22 +142,74 @@ RC BaseNamedObject::InitSecurityAttr(SECURITY_ATTRIBUTES& sa)
     }
     return RC::SUCCESS;
 }
+#else
+RC BaseNamedObject::InitSecurityAttr(SECURITY_ATTRIBUTES& sa)
+{
+    (void)sa;
+    return RC::SUCCESS;
+}
+
+static std::string CleanPosixName(const char* pName)
+{
+    std::string s = "/tlp_";
+    for (const char* p = pName; *p; ++p)
+    {
+        if (isalnum(*p) || *p == '_' || *p == '-')
+            s += *p;
+        else
+            s += '_';
+    }
+    if (s.size() > 63)
+        s.resize(63);
+    return s;
+}
+
+struct PosixNamedMutexData
+{
+    pthread_mutex_t mutex;
+    int init_magic;
+};
+#endif
 
 
 //
 GenericEvent::GenericEvent()
 {
+#ifdef Windows
     m_hHandle = CreateEventA(T_NULL, T_TRUE, T_FALSE, T_NULL);
     if (T_INVHDL == m_hHandle)
     {
         LogVital("Unable to create generic event!");
     }
+#else
+    sem_t* pSem = new sem_t;
+    if (sem_init(pSem, 0, 0) != 0)
+    {
+        delete pSem;
+        m_hHandle = T_INVHDL;
+        LogVital("Unable to create generic event!");
+    }
+    else
+    {
+        m_hHandle = (T_HANDLE)pSem;
+    }
+#endif
 }
 
 
 //
 GenericEvent::~GenericEvent()
 {
+#ifdef Windows
+#else
+    if (m_hHandle != T_INVHDL && m_hHandle != T_NULL)
+    {
+        sem_t* pSem = (sem_t*)m_hHandle;
+        sem_destroy(pSem);
+        delete pSem;
+        m_hHandle = T_INVHDL;
+    }
+#endif
 }
 
 
@@ -154,6 +217,7 @@ GenericEvent::~GenericEvent()
 NamedEvent::NamedEvent(T_PCSTR pName):
     BaseNamedObject::BaseNamedObject(pName)
 {
+#ifdef Windows
     PSECURITY_ATTRIBUTES pSecAttr = T_NULL;
     SECURITY_ATTRIBUTES sa;
     if (m_bGlobal)
@@ -178,12 +242,41 @@ NamedEvent::NamedEvent(T_PCSTR pName):
     {
         LogInfo("Named event:%s created!", m_strName);
     }
+#else
+    std::string semName = CleanPosixName(m_strName);
+    sem_t* pSem = sem_open(semName.c_str(), O_CREAT, 0666, 0);
+    if (pSem == SEM_FAILED)
+    {
+        BaseEvent::m_hHandle = T_INVHDL;
+        BaseNamedObject::m_hHandle = T_INVHDL;
+        LogVital("Unable to create named event: %s (errno: %d)!", semName.c_str(), errno);
+    }
+    else
+    {
+        BaseEvent::m_hHandle = (T_HANDLE)pSem;
+        BaseNamedObject::m_hHandle = (T_HANDLE)pSem;
+        LogInfo("Named event:%s created!", m_strName);
+    }
+#endif
+}
+
+NamedEvent::~NamedEvent()
+{
+#ifndef Windows
+    if (BaseEvent::m_hHandle != T_INVHDL && BaseEvent::m_hHandle != T_NULL)
+    {
+        sem_close((sem_t*)BaseEvent::m_hHandle);
+        BaseEvent::m_hHandle = T_INVHDL;
+        BaseNamedObject::m_hHandle = T_INVHDL;
+    }
+#endif
 }
 
 
 //
 RC BaseEvent::Post(T_BOOL bReset)
 {
+#ifdef Windows
     if (!SetEvent(m_hHandle))
     {
         LogWarn("BaseEvent::Post() failed to SetEvent");
@@ -198,25 +291,49 @@ RC BaseEvent::Post(T_BOOL bReset)
         }
     }
     return RC::SUCCESS;
+#else
+    if (m_hHandle == T_INVHDL || !m_hHandle)
+        return RC::FAILED;
+    sem_t* pSem = (sem_t*)m_hHandle;
+    int val = 0;
+    sem_getvalue(pSem, &val);
+    if (val <= 0)
+    {
+        sem_post(pSem);
+    }
+    if (bReset)
+    {
+        while (sem_trywait(pSem) == 0) {}
+    }
+    return RC::SUCCESS;
+#endif
 }
 
 
 //
 RC BaseEvent::Reset()
 {
+#ifdef Windows
     if (!ResetEvent(m_hHandle))
     {
         LogWarn("BaseEvent::Reset() failed to ResetEvent");
         return RC::FAILED;
     }
     return RC::SUCCESS;
+#else
+    if (m_hHandle == T_INVHDL || !m_hHandle)
+        return RC::FAILED;
+    sem_t* pSem = (sem_t*)m_hHandle;
+    while (sem_trywait(pSem) == 0) {}
+    return RC::SUCCESS;
+#endif
 }
 
 
 //
 RC BaseEvent::Wait(T_UINT32 nMilliseconds)
 {
-
+#ifdef Windows
     switch (WaitForSingleObject(m_hHandle, nMilliseconds))
     {
     case WAIT_OBJECT_0:
@@ -224,23 +341,72 @@ RC BaseEvent::Wait(T_UINT32 nMilliseconds)
     default:
         return RC::FAILED;
     }
+#else
+    if (m_hHandle == T_INVHDL || !m_hHandle)
+        return RC::FAILED;
+    sem_t* pSem = (sem_t*)m_hHandle;
+    if (nMilliseconds == INFINITE)
+    {
+        if (sem_wait(pSem) == 0)
+            return RC::SUCCESS;
+        return RC::FAILED;
+    }
+    else
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += nMilliseconds / 1000;
+        ts.tv_nsec += (nMilliseconds % 1000) * 1000000;
+        if (ts.tv_nsec >= 1000000000)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+        int err = sem_timedwait(pSem, &ts);
+        if (err == 0)
+            return RC::SUCCESS;
+        if (errno == ETIMEDOUT)
+            return RC::TIMEOUT;
+        return RC::FAILED;
+    }
+#endif
 }
 
 
 //
 GenericMutex::GenericMutex()
 {
+#ifdef Windows
     m_hHandle = CreateMutexA(NULL, FALSE, NULL);
     if (T_INVHDL == m_hHandle)
     {
         LogVital("Unable to create generic mutex!");
     }
+#else
+    pthread_mutex_t* pMutex = new pthread_mutex_t;
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(pMutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+    m_hHandle = (T_HANDLE)pMutex;
+#endif
 }
 
 
 //
 GenericMutex::~GenericMutex()
 {
+#ifdef Windows
+#else
+    if (m_hHandle != T_INVHDL && m_hHandle != T_NULL)
+    {
+        pthread_mutex_t* pMutex = (pthread_mutex_t*)m_hHandle;
+        pthread_mutex_destroy(pMutex);
+        delete pMutex;
+        m_hHandle = T_INVHDL;
+    }
+#endif
 }
 
 
@@ -248,7 +414,7 @@ GenericMutex::~GenericMutex()
 NamedMutex::NamedMutex(T_PCSTR pName) :
     BaseNamedObject::BaseNamedObject(pName)
 {
-
+#ifdef Windows
     if (m_bGlobal)
     {
         SECURITY_ATTRIBUTES sa;
@@ -266,13 +432,73 @@ NamedMutex::NamedMutex(T_PCSTR pName) :
     {
         LogVital("Unable to create named mutex!");
     }
+#else
+    std::string shmName = CleanPosixName(m_strName);
+    shmName += "_mtx";
+    int fd = shm_open(shmName.c_str(), O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+    {
+        BaseMutex::m_hHandle = T_INVHDL;
+        BaseNamedObject::m_hHandle = T_INVHDL;
+        LogVital("Unable to create named mutex %s (errno: %d)!", shmName.c_str(), errno);
+        return;
+    }
+    
+    struct stat sb;
+    fstat(fd, &sb);
+    bool bNew = (sb.st_size < (off_t)sizeof(PosixNamedMutexData));
+    if (bNew)
+    {
+        ftruncate(fd, sizeof(PosixNamedMutexData));
+    }
+    
+    void* addr = mmap(NULL, sizeof(PosixNamedMutexData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    
+    if (addr == MAP_FAILED)
+    {
+        BaseMutex::m_hHandle = T_INVHDL;
+        BaseNamedObject::m_hHandle = T_INVHDL;
+        LogVital("Unable to mmap named mutex %s!", shmName.c_str());
+        return;
+    }
+    
+    PosixNamedMutexData* pData = (PosixNamedMutexData*)addr;
+    if (bNew || pData->init_magic != 0x544C504D) // 'TLPM'
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+        pthread_mutex_init(&pData->mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+        pData->init_magic = 0x544C504D;
+    }
+    
+    BaseMutex::m_hHandle = (T_HANDLE)&pData->mutex;
+    BaseNamedObject::m_hHandle = (T_HANDLE)&pData->mutex;
+#endif
+}
+
+NamedMutex::~NamedMutex()
+{
+#ifndef Windows
+    if (BaseMutex::m_hHandle != T_INVHDL && BaseMutex::m_hHandle != T_NULL)
+    {
+        void* addr = (void*)((uintptr_t)BaseMutex::m_hHandle - offsetof(PosixNamedMutexData, mutex));
+        munmap(addr, sizeof(PosixNamedMutexData));
+        BaseMutex::m_hHandle = T_INVHDL;
+        BaseNamedObject::m_hHandle = T_INVHDL;
+    }
+#endif
 }
 
 
 //
-#ifdef Windows
 RC BaseMutex::Lock(T_UINT32 nMilliseconds)
 {
+#ifdef Windows
     switch (WaitForSingleObject(m_hHandle, nMilliseconds))
     {
     case WAIT_OBJECT_0:
@@ -285,39 +511,8 @@ RC BaseMutex::Lock(T_UINT32 nMilliseconds)
         LogError("WaitForSingleObject error:%d", GetLastError());
         return RC::FAILED;
     }
-}
-
-
-//
-RC BaseMutex::TryLock(T_UINT32 nMilliseconds)
-{
-    switch (WaitForSingleObject(m_hHandle, nMilliseconds))
-    {
-    case WAIT_OBJECT_0:
-        return RC::SUCCESS;
-    case WAIT_TIMEOUT:
-        return RC::TIMEOUT;
-    case WAIT_ABANDONED:
-        return RC::ABANDONED;
-    default:
-        return RC::FAILED;
-    }
-}
-
-
-//
-RC BaseMutex::Unlock()
-{
-    if (ReleaseMutex(m_hHandle)) 
-    {
-        return RC::SUCCESS;
-    }
-    return RC::FAILED;
-}
 #else
-RC BaseMutex::Lock(T_UINT32 nMilliseconds)
-{
-    if (m_hHandle == T_INVHDL)
+    if (m_hHandle == T_INVHDL || !m_hHandle)
     {
         return RC::FAILED;
     }
@@ -354,13 +549,27 @@ RC BaseMutex::Lock(T_UINT32 nMilliseconds)
         return RC::TIMEOUT;
     }
     return RC::FAILED;
+#endif
 }
 
 
 //
 RC BaseMutex::TryLock(T_UINT32 nMilliseconds)
 {
-    if (m_hHandle == T_INVHDL)
+#ifdef Windows
+    switch (WaitForSingleObject(m_hHandle, nMilliseconds))
+    {
+    case WAIT_OBJECT_0:
+        return RC::SUCCESS;
+    case WAIT_TIMEOUT:
+        return RC::TIMEOUT;
+    case WAIT_ABANDONED:
+        return RC::ABANDONED;
+    default:
+        return RC::FAILED;
+    }
+#else
+    if (m_hHandle == T_INVHDL || !m_hHandle)
     {
         return RC::FAILED;
     }
@@ -377,16 +586,28 @@ RC BaseMutex::TryLock(T_UINT32 nMilliseconds)
     }
     if (err == EBUSY)
     {
+        if (nMilliseconds > 0 && nMilliseconds != INFINITE)
+        {
+            return Lock(nMilliseconds);
+        }
         return RC::TIMEOUT;
     }
     return RC::FAILED;
+#endif
 }
 
 
 //
 RC BaseMutex::Unlock()
 {
-    if (m_hHandle == T_INVHDL)
+#ifdef Windows
+    if (ReleaseMutex(m_hHandle)) 
+    {
+        return RC::SUCCESS;
+    }
+    return RC::FAILED;
+#else
+    if (m_hHandle == T_INVHDL || !m_hHandle)
     {
         return RC::FAILED;
     }
@@ -396,8 +617,8 @@ RC BaseMutex::Unlock()
         return RC::SUCCESS;
     }
     return RC::FAILED;
-}
 #endif
+}
 
 
 //
@@ -411,7 +632,7 @@ SharedMemory::SharedMemory(T_PCSTR pName,
     m_eMode(eMode),
     m_pAddress(T_NULL)
 {
-
+#ifdef Windows
     //Try to open
     m_hHandle = OpenFileMappingA((m_eMode == AccessMode::AM_READWRITE) ? FILE_MAP_WRITE | FILE_MAP_READ : FILE_MAP_READ, T_FALSE, m_strName);
     if(!m_hHandle)
@@ -447,7 +668,7 @@ SharedMemory::SharedMemory(T_PCSTR pName,
         {
             m_hHandle = CreateFileMappingA(T_INVHDL, 
                 T_NULL, 
-                (T_UINT32)m_eMode,
+                (T_UINT32)m_eMode, 
                 0, 
                 m_nSize, 
                 m_strName);
@@ -462,6 +683,32 @@ SharedMemory::SharedMemory(T_PCSTR pName,
         LogInfo("CreateFileMappingA：%s with mode:%d size:%d", m_strName, m_eMode, m_nSize);
     }
     Map();
+#else
+    std::string shmName = CleanPosixName(m_strName);
+    int oflag = (m_eMode == AccessMode::AM_READWRITE) ? (O_RDWR | O_CREAT) : O_RDONLY;
+    int fd = shm_open(shmName.c_str(), oflag, 0666);
+    if (fd < 0)
+    {
+        LogVital("SharedMemory(): Failed to shm_open %s (errno: %d)", shmName.c_str(), errno);
+        return;
+    }
+    m_hFileHandle = (T_HANDLE)(intptr_t)fd;
+    m_hHandle = m_hFileHandle;
+    BaseObject::m_hHandle = m_hHandle;
+
+    struct stat sb;
+    if (fstat(fd, &sb) == 0)
+    {
+        if (sb.st_size < (off_t)m_nSize && (m_eMode == AccessMode::AM_READWRITE))
+        {
+            if (ftruncate(fd, m_nSize) != 0)
+            {
+                LogError("SharedMemory(): ftruncate failed on %s (errno: %d)", shmName.c_str(), errno);
+            }
+        }
+    }
+    Map();
+#endif
 }
 
 
@@ -476,6 +723,7 @@ SharedMemory::~SharedMemory()
 //
 T_VOID SharedMemory::Map()
 {
+#ifdef Windows
     T_PVOID pAddr = MapViewOfFile(m_hHandle, 
         (m_eMode == AccessMode::AM_READWRITE)? FILE_MAP_WRITE| FILE_MAP_READ: FILE_MAP_READ,
         0, 
@@ -491,6 +739,21 @@ T_VOID SharedMemory::Map()
         LogInfo("MapViewOfFile success with size:%d", m_nSize);
     }
     m_pAddress = static_cast<T_PSTR>(pAddr);
+#else
+    int prot = (m_eMode == AccessMode::AM_READWRITE) ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    int fd = (int)(intptr_t)m_hHandle;
+    void* pAddr = mmap(NULL, m_nSize, prot, MAP_SHARED, fd, 0);
+    if (pAddr == MAP_FAILED)
+    {
+        pAddr = NULL;
+        LogVital("SharedMemory::Map(): Failed to mmap, size:%d (errno: %d)", m_nSize, errno);
+    }
+    else
+    {
+        LogInfo("mmap success with size:%d", m_nSize);
+    }
+    m_pAddress = static_cast<T_PSTR>(pAddr);
+#endif
 }
 
 
@@ -518,11 +781,19 @@ T_UINT32 SharedMemory::GetSize()
 //
 T_VOID SharedMemory::Unmap()
 {
+#ifdef Windows
     if (m_pAddress)
     {
         UnmapViewOfFile(m_pAddress);
         m_pAddress = T_NULL;
     }
+#else
+    if (m_pAddress && m_pAddress != MAP_FAILED)
+    {
+        munmap(m_pAddress, m_nSize);
+        m_pAddress = T_NULL;
+    }
+#endif
 }
 
 
@@ -538,7 +809,17 @@ AccessMode SharedMemory::GetMode()
 //
 T_VOID SharedMemory::Close()
 {
+#ifdef Windows
     SAFE_CLOSE_HANDLE(m_hFileHandle);
+#else
+    if (m_hFileHandle != T_INVHDL && m_hFileHandle != T_NULL)
+    {
+        close((int)(intptr_t)m_hFileHandle);
+        m_hFileHandle = T_INVHDL;
+        m_hHandle = T_INVHDL;
+        BaseObject::m_hHandle = T_INVHDL;
+    }
+#endif
 }
 
 
@@ -557,19 +838,30 @@ Logger::Logger() :
 {
     time_t t    = time(T_NULL);
     tm t1        = { 0 };
+#ifdef Windows
     localtime_s(&t1, &t);
     T_STRING strFormat = "%s\\teleport_proc";
     strFormat += I64_FMT;
     sprintf_s(m_szBuffer, strFormat.c_str(), LOG_DIR, TLP::TGetProcId());
     T_UINT32 nLen = (T_UINT32)strlen(m_szBuffer);
-    strftime(m_szBuffer + nLen, MAX_BUFFER_LEN, "_%Y%m%d_%H%M%S.log", &t1);
+    strftime(m_szBuffer + nLen, MAX_BUFFER_LEN - nLen, "_%Y%m%d_%H%M%S.log", &t1);
     TMakeDirectory(LOG_DIR);
+    InitializeCriticalSection(&m_cs);
+#else
+    localtime_r(&t, &t1);
+    T_STRING strFormat = "%s/teleport_proc";
+    strFormat += I64_FMT;
+    snprintf(m_szBuffer, sizeof(m_szBuffer), strFormat.c_str(), LOG_DIR, TLP::TGetProcId());
+    T_UINT32 nLen = (T_UINT32)strlen(m_szBuffer);
+    strftime(m_szBuffer + nLen, MAX_BUFFER_LEN - nLen, "_%Y%m%d_%H%M%S.log", &t1);
+    TMakeDirectory(LOG_DIR);
+    pthread_mutex_init(&m_cs, NULL);
+#endif
     m_ofStream.open(m_szBuffer);
     if(!m_ofStream.is_open())
     {
         m_bLoggerEnable = T_FALSE;
     }
-    InitializeCriticalSection(&m_cs);
 }
 
 
@@ -577,6 +869,9 @@ Logger::Logger() :
 Logger::~Logger()
 {
     m_ofStream.close();
+#ifndef Windows
+    pthread_mutex_destroy(&m_cs);
+#endif
 }
 
 
@@ -591,25 +886,37 @@ Logger& Logger::Instance()
 //
 RC Logger::Log(LoggerType eType, T_PCSTR pFormat, ...)
 {
-    
     if(m_bLoggerEnable)
     {
         if(eType > m_loggerLevel)
         {
             return RC::ABANDONED;
         }
+
+#ifdef Windows
         EnterCriticalSection(&m_cs);
+#else
+        pthread_mutex_lock(&m_cs);
+#endif
         try 
         {
             time_t t = time(T_NULL);
             tm t1    = { 0 };
+#ifdef Windows
             localtime_s(&t1, &t);
+#else
+            localtime_r(&t, &t1);
+#endif
             va_list l;
             va_start(l, pFormat);
             strftime(m_szBuffer, MAX_BUFFER_LEN, "%Y-%m-%d %H:%M:%S", &t1);
             m_ofStream << m_szBuffer;
             m_ofStream << " [" << TypeToString(eType) << "] ";
+#ifdef Windows
             vsprintf_s(m_szBuffer, pFormat, l);
+#else
+            vsnprintf(m_szBuffer, sizeof(m_szBuffer), pFormat, l);
+#endif
             m_ofStream << m_szBuffer;
 
             if ( (eType == LoggerType::LOG_ERROR) ||
@@ -629,10 +936,18 @@ RC Logger::Log(LoggerType eType, T_PCSTR pFormat, ...)
         }
         catch(...)
         {
+#ifdef Windows
             LeaveCriticalSection(&m_cs);
+#else
+            pthread_mutex_unlock(&m_cs);
+#endif
             return RC::FAILED;
         }
-        LeaveCriticalSection(&m_cs);
+#ifdef Windows
+            LeaveCriticalSection(&m_cs);
+#else
+            pthread_mutex_unlock(&m_cs);
+#endif
         if (eType == LoggerType::LOG_VITAL)
         {
             exit(-1);
@@ -695,6 +1010,37 @@ RC Logger::SetLevel(LoggerType eType)
 }
 
 
+#ifndef Windows
+struct PosixThreadThunk
+{
+    PFN_ThreadRoutine pRoutine;
+    T_PVOID pArgs;
+    volatile bool bStarted;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+};
+
+static void* PosixThreadProc(void* arg)
+{
+    PosixThreadThunk* th = (PosixThreadThunk*)arg;
+    pthread_mutex_lock(&th->mtx);
+    while (!th->bStarted)
+    {
+        pthread_cond_wait(&th->cv, &th->mtx);
+    }
+    pthread_mutex_unlock(&th->mtx);
+
+    PFN_ThreadRoutine pRoutine = th->pRoutine;
+    T_PVOID pArgs = th->pArgs;
+    pthread_mutex_destroy(&th->mtx);
+    pthread_cond_destroy(&th->cv);
+    delete th;
+
+    pRoutine(pArgs);
+    return NULL;
+}
+#endif
+
 //
 RC Thread::Create(PFN_ThreadRoutine pRoutineAddr, T_PVOID pArgs) 
 {
@@ -713,9 +1059,25 @@ RC Thread::Create(PFN_ThreadRoutine pRoutineAddr, T_PVOID pArgs)
     }
     return RC::SUCCESS;
 #else
-    return RC::NOT_IMPLEMENTED;
+    PosixThreadThunk* th = new PosixThreadThunk();
+    th->pRoutine = pRoutineAddr;
+    th->pArgs = pArgs;
+    th->bStarted = false;
+    pthread_mutex_init(&th->mtx, NULL);
+    pthread_cond_init(&th->cv, NULL);
+
+    pthread_t tid;
+    int err = pthread_create(&tid, NULL, PosixThreadProc, th);
+    if (err != 0)
+    {
+        delete th;
+        LogError("Failed to create thread, err: %d", err);
+        return RC::FAILED;
+    }
+    m_hThread = (T_HANDLE)th;
+    m_nThreadId = (T_ULONG)tid;
+    return RC::SUCCESS;
 #endif
-    
 }
 
 
@@ -723,15 +1085,25 @@ RC Thread::Create(PFN_ThreadRoutine pRoutineAddr, T_PVOID pArgs)
 RC Thread::Start()
 {
     m_bRunning = T_TRUE;
-#if Windows
+#ifdef Windows
     if(0 >  ResumeThread(m_hThread))
     {
         return RC::FAILED;
     }
     return RC::SUCCESS;
 #else
+    if (m_hThread != T_INVHDL && m_hThread != T_NULL)
+    {
+        PosixThreadThunk* th = (PosixThreadThunk*)m_hThread;
+        pthread_mutex_lock(&th->mtx);
+        th->bStarted = true;
+        pthread_cond_signal(&th->cv);
+        pthread_mutex_unlock(&th->mtx);
+        m_hThread = (T_HANDLE)(intptr_t)m_nThreadId;
+        return RC::SUCCESS;
+    }
+    return RC::FAILED;
 #endif
-    return RC::NOT_IMPLEMENTED;
 }
 
 
@@ -741,8 +1113,15 @@ RC Thread::Stop()
     while (m_bRunning)
     {
         LogInfo("Stop thread#%d, trying...", m_nThreadId);
-        TSleep(50);
+        TSleep(10);
     }
+#ifndef Windows
+    if (m_nThreadId != 0)
+    {
+        pthread_join((pthread_t)m_nThreadId, NULL);
+        m_nThreadId = 0;
+    }
+#endif
     LogInfo("Thread #%d Stopped.", m_nThreadId);
     return RC::SUCCESS;
 }
@@ -762,7 +1141,7 @@ T_ID TLP::TGetProcId()
 #ifdef Windows
     return (T_ID)::GetCurrentProcessId();
 #else
-    return 0;
+    return (T_ID)::getpid();
 #endif
 }
 
@@ -772,7 +1151,7 @@ T_ID TLP::TGetThreadId()
 #ifdef Windows
     return (T_ID)::GetCurrentThreadId();
 #else
-    return 0;
+    return (T_ID)::syscall(SYS_gettid);
 #endif
 }
 
@@ -782,7 +1161,7 @@ T_UINT32 TLP::TGetError()
 #ifdef Windows
     return GetLastError();
 #else
-    return 0;
+    return errno;
 #endif
 }
 
@@ -806,17 +1185,18 @@ T_PTSTR TLP::TGetErrorMessage(T_UINT32 nErrorCode)
     }
     return T_NULL;
 #else
-    return T_NULL;
+    return strerror(nErrorCode);
 #endif
 }
 
 
 //
-T_VOID TLP::TSleep(UINT32 nMilliseconds)
+T_VOID TLP::TSleep(T_UINT32 nMilliseconds)
 {
 #ifdef Windows
     ::Sleep(nMilliseconds);
 #else
+    usleep((useconds_t)nMilliseconds * 1000);
 #endif
 }
 
@@ -827,7 +1207,7 @@ T_VOID TLP::TFree(T_PVOID pBuffer)
 #ifdef Windows
     LocalFree(pBuffer);
 #else
-    free(pBuffer);
+    // Free only if dynamically allocated
 #endif
     pBuffer = T_NULL;
 }
@@ -836,7 +1216,7 @@ T_VOID TLP::TFree(T_PVOID pBuffer)
 //
 std::string TLP::TMakeGuid()
 {
-#if Windows
+#ifdef Windows
     char szBuffer[MAX_GUID] = { 0 };
     GUID guid;
     HRESULT hr = CoCreateGuid(&guid);
@@ -852,18 +1232,35 @@ std::string TLP::TMakeGuid()
             guid.Data4[7]);
         return std::string(szBuffer);
     }
-#endif
     return std::string();
-
+#else
+    std::ifstream uuidFile("/proc/sys/kernel/random/uuid");
+    std::string uuidStr;
+    if (uuidFile >> uuidStr)
+    {
+        return "{" + uuidStr + "}";
+    }
+    char szBuffer[MAX_GUID] = {0};
+    snprintf(szBuffer, sizeof(szBuffer), "{%08x-%04x-%04x-%04x-%012llx}",
+        (unsigned int)rand(), (unsigned int)(rand() & 0xFFFF),
+        (unsigned int)((rand() & 0x0FFF) | 0x4000),
+        (unsigned int)((rand() & 0x3FFF) | 0x8000),
+        (unsigned long long)(((uint64_t)rand() << 32) | rand()) & 0xFFFFFFFFFFFFULL);
+    return std::string(szBuffer);
+#endif
 }
 
 
 //
 T_HANDLE TLP::TCreateEvent()
 {
-#if Windows
+#ifdef Windows
     return CreateEvent(NULL, TRUE, FALSE, NULL);
 #else
+    sem_t* pSem = new sem_t;
+    if (sem_init(pSem, 0, 0) == 0)
+        return (T_HANDLE)pSem;
+    delete pSem;
     return T_INVHDL;
 #endif
 }
@@ -875,6 +1272,15 @@ T_BOOL TLP::TSetEvent(T_HANDLE hEvent)
 #ifdef Windows
     return SetEvent(hEvent);
 #else
+    if (hEvent != T_INVHDL && hEvent != T_NULL)
+    {
+        sem_t* pSem = (sem_t*)hEvent;
+        int val = 0;
+        sem_getvalue(pSem, &val);
+        if (val <= 0)
+            sem_post(pSem);
+        return T_TRUE;
+    }
     return T_FALSE;
 #endif
 }
@@ -883,10 +1289,10 @@ T_BOOL TLP::TMakeDirectory(T_PCSTR pDirPathName)
 {
     if (TFileExist(pDirPathName))
         return T_FALSE;
-#if Windows
+#ifdef Windows
     return CreateDirectory(pDirPathName, T_NULL);
 #else
-    return RC::NOT_IMPLEMENTED;
+    return mkdir(pDirPathName, 0755) == 0;
 #endif
 }
 
@@ -928,7 +1334,17 @@ RC TLP::TShellRun(T_PCSTR pFile, T_PCSTR pParams)
     }
     return RC::FAILED;
 #else
-    return RC::NOT_IMPLEMENTED;
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        execlp(pFile, pFile, pParams, (char*)NULL);
+        _exit(127);
+    }
+    else if (pid > 0)
+    {
+        return RC::SUCCESS;
+    }
+    return RC::FAILED;
 #endif
 }
 
@@ -1021,5 +1437,3 @@ T_UINT32 TLP::TComputeCRC32(T_PCVOID pData, T_UINT32 nLength)
     }
     return ~nCrc;
 }
-
-

@@ -2,6 +2,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <algorithm>
+#include <numeric>
 #include "teleport.hpp"
 
 using namespace TLP;
@@ -1653,6 +1655,145 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
     SHOULD_BE_EQUAL(g_nStressOrderErrorCount, 0);
 }
 
+static std::vector<double> g_vOneWayLatenciesUs;
+static std::mutex g_mtxLatency;
+static RC LatencyTestCallback(PTCbMessage pMessage)
+{
+    if (pMessage && pMessage->eType == MsgType::MSG_SUB_GET && pMessage->nLength >= sizeof(uint64_t))
+    {
+        uint64_t sendNs = *(uint64_t*)pMessage->pData;
+        auto nowNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        if (nowNs >= sendNs)
+        {
+            double us = (double)(nowNs - sendNs) / 1000.0;
+            std::lock_guard<std::mutex> lk(g_mtxLatency);
+            g_vOneWayLatenciesUs.push_back(us);
+        }
+    }
+    return RC::SUCCESS;
+}
+
+static RC DummyRpcHandler(T_PCVOID pReqData, T_UINT32 nReqLen, T_PVOID pRespBuf, T_UINT32& nRespLen)
+{
+    if (nReqLen > 0 && pReqData)
+    {
+        memcpy(pRespBuf, pReqData, (nReqLen < nRespLen) ? nReqLen : nRespLen);
+        nRespLen = (nReqLen < nRespLen) ? nReqLen : nRespLen;
+    }
+    return RC::SUCCESS;
+}
+
+static void PrintLatencyPercentiles(const char* title, std::vector<double>& latencies)
+{
+    if (latencies.empty()) return;
+    std::sort(latencies.begin(), latencies.end());
+    size_t n = latencies.size();
+    double minV = latencies.front();
+    double maxV = latencies.back();
+    double sum = std::accumulate(latencies.begin(), latencies.end(), 0.0);
+    double meanV = sum / n;
+    double p50 = latencies[(size_t)(n * 0.50)];
+    double p90 = latencies[(size_t)(n * 0.90)];
+    double p99 = latencies[(size_t)(n * 0.99)];
+    double p999 = latencies[(size_t)(n * 0.999)];
+
+    printf("\n================ %s (Samples: %zu) ================\n", title, n);
+    printf("  Min Latency:    %8.3f us (%7.1f ns)\n", minV, minV * 1000.0);
+    printf("  Mean Latency:   %8.3f us (%7.1f ns)\n", meanV, meanV * 1000.0);
+    printf("  P50  (Median):  %8.3f us (%7.1f ns)\n", p50, p50 * 1000.0);
+    printf("  P90:            %8.3f us (%7.1f ns)\n", p90, p90 * 1000.0);
+    printf("  P99:            %8.3f us (%7.1f ns)\n", p99, p99 * 1000.0);
+    printf("  P99.9:          %8.3f us (%7.1f ns)\n", p999, p999 * 1000.0);
+    printf("  Max Latency:    %8.3f us (%7.1f ns)\n", maxV, maxV * 1000.0);
+    printf("======================================================================\n");
+}
+
+void UT_BenchmarkLatency(T_UINT32 nSamples = 100000)
+{
+    printf("Running End-to-End Latency Benchmark (%u samples)...\n", nSamples);
+    g_vOneWayLatenciesUs.clear();
+    g_vOneWayLatenciesUs.reserve(nSamples);
+
+    // 1. One-way Pub/Sub Latency
+    T_PCSTR pTopic = "ut_latency_topic";
+    T_ID nSubId = 0, nPubId = 0;
+    RC rc = ITeleport::Open(pTopic, CH_LISTEN | CH_CREATE_IF_NOEXIST, nSubId, LatencyTestCallback, T_FALSE);
+    if (IS_FAILED(rc)) { printf("Open sub failed\n"); return; }
+    rc = ITeleport::Open(pTopic, CH_SEND | CH_CREATE_IF_NOEXIST, nPubId, LatencyTestCallback, T_FALSE);
+    if (IS_FAILED(rc)) { printf("Open pub failed\n"); return; }
+
+    // Warm-up
+    for (int w = 0; w < 1000; w++)
+    {
+        uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        ITeleport::Send(nPubId, &t, sizeof(t));
+    }
+    TSleep(50);
+    {
+        std::lock_guard<std::mutex> lk(g_mtxLatency);
+        g_vOneWayLatenciesUs.clear();
+    }
+
+    for (T_UINT32 i = 0; i < nSamples; i++)
+    {
+        uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        ITeleport::Send(nPubId, &t, sizeof(t));
+        if ((i & 0x1ff) == 0) TSleep(0);
+    }
+
+    int waitLimit = 200;
+    while (true)
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_mtxLatency);
+            if (g_vOneWayLatenciesUs.size() >= nSamples || waitLimit <= 0) break;
+        }
+        TSleep(10);
+        waitLimit--;
+    }
+    ITeleport::Close(nPubId, T_TRUE);
+    ITeleport::Close(nSubId, T_TRUE);
+
+    PrintLatencyPercentiles("One-Way End-to-End Latency (Pub -> Sub)", g_vOneWayLatenciesUs);
+
+    // 2. Round-Trip RPC Latency
+    T_PCSTR pRpcTopic = "ut_latency_rpc";
+    ITeleport::RegisterRpcService(pRpcTopic, DummyRpcHandler, T_FALSE);
+    std::vector<double> rttLatencies;
+    rttLatencies.reserve(nSamples);
+
+    char reqBuf[64] = "ping";
+    char respBuf[64] = {0};
+    T_UINT32 respLen = sizeof(respBuf);
+
+    // Warmup
+    for (int w = 0; w < 500; w++)
+    {
+        respLen = sizeof(respBuf);
+        ITeleport::Call(pRpcTopic, reqBuf, 4, respBuf, respLen, 1000, T_FALSE);
+    }
+
+    for (T_UINT32 i = 0; i < nSamples; i++)
+    {
+        respLen = sizeof(respBuf);
+        auto tStart = std::chrono::high_resolution_clock::now();
+        rc = ITeleport::Call(pRpcTopic, reqBuf, 4, respBuf, respLen, 1000, T_FALSE);
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        if (IS_SUCCESS(rc))
+        {
+            double us = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tStart).count() / 1000.0;
+            rttLatencies.push_back(us);
+        }
+    }
+    ITeleport::UnregisterRpcService(pRpcTopic);
+
+    PrintLatencyPercentiles("Synchronous RPC Round-Trip (RTT) Latency", rttLatencies);
+}
+
+
 
 #pragma pack(push, 1)
 typedef struct _TStressPayload
@@ -1686,6 +1827,10 @@ static RC MPListenCallback(PTCbMessage pMessage)
             if (nSeq != g_mSenderLastSeq[nSenderId] + 1)
             {
                 g_nMPOrderErrors++;
+                if (g_nMPOrderErrors <= 20)
+                {
+                    printf("ORDER_ERR: Sender %u: expected %u, got %u\n", nSenderId, g_mSenderLastSeq[nSenderId] + 1, nSeq);
+                }
             }
             g_mSenderLastSeq[nSenderId] = nSeq;
         }
@@ -1917,6 +2062,11 @@ int main(int argc, char** argv)
             UT_TestStress(2000000);
             return 0;
         }
+        else if (0 == _stricmp(pCmd, "latency"))
+        {
+            UT_BenchmarkLatency(50000);
+            return 0;
+        }
     }
     else if (argc == 3)
     {
@@ -1925,6 +2075,13 @@ int main(int argc, char** argv)
             T_UINT32 nTotal = (T_UINT32)atoi(argv[2]);
             if (nTotal == 0) nTotal = 2000000;
             UT_TestStress(nTotal);
+            return 0;
+        }
+        else if (0 == _stricmp(pCmd, "latency"))
+        {
+            T_UINT32 nTotal = (T_UINT32)atoi(argv[2]);
+            if (nTotal == 0) nTotal = 50000;
+            UT_BenchmarkLatency(nTotal);
             return 0;
         }
         T_UINT32 nConfIndex = atoi(argv[2]);
