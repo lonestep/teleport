@@ -12,11 +12,11 @@ High-performance, zero-daemon, shared-memory Inter-Process Communication (IPC) l
 
 Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流桌面端、服务器端操作系统与容器环境。
 
-| 操作系统 / OS | 最低版本要求 | 验证环境 | 体系架构 | 同步机制 / IPC 原语 |
-| :--- | :--- | :--- | :---: | :--- |
-| **Linux** | Linux Kernel 3.10+ | Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 12, RHEL / CentOS 9/10 | x86_64, aarch64 | POSIX Shared Memory (`shm_open`, `mmap`), Robust Process-Shared `pthread_mutex`, POSIX Semaphore |
-| **Windows** | Windows 7 / Server 2008 R2 | Windows 11, Windows 10, Windows Server 2022 / 2019 | x86_64, x86 | Win32 File Mapping (`CreateFileMapping`), Win32 Mutex, Win32 Manual-Reset Event |
-| **Container** | OCI 兼容容器运行时 | Docker, Podman (Ubuntu 24.04 LTS Container, Windows VM on KVM) | x86_64 | 容器内共享内存与主机卷挂载映射 |
+| 操作系统 / OS | 最低版本要求 | 验证环境 | 体系架构 |
+| :--- | :--- | :--- | :---: |
+| **Linux** | Linux Kernel 3.10+ | Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 12, RHEL / CentOS 9/10 | x86_64, aarch64 |
+| **Windows** | Windows 7 / Server 2008 R2 | Windows 11, Windows 10, Windows Server 2022 / 2019 | x86_64, x86 |
+| **Container** | OCI 兼容容器运行时 | Docker, Podman (Ubuntu 24.04 LTS Container, Windows VM on KVM) | x86_64 |
 
 ### 编译器兼容性 (Compiler Compatibility)
 
@@ -46,34 +46,34 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ### 3.1 核心架构与设计选型对比 (Core Architecture Comparison)
 
-| 核心设计维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG | POSIX shm (Raw) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **拓扑与通道模型** | **无中心点对多广播 / 专用RPC链路** | 单向流通道 (Stream Channel) | 发布/订阅与请求/响应服务 | 节点间套接字拓扑 (REQ/REP, PUB/SUB) | 裸共享内存段，需自行规划寻址 |
-| **外部守护进程依赖** | **零守护进程 (Daemon-Free, 点对点直连)** | 必须独立运行 **Media Driver** 守护进程 | 必须独立运行 **RouDi** 管理中枢守护进程 | 进程内线程引擎，无外部独立守护进程 | 无外部守护进程 |
-| **内存组织形态** | **单一片上连续环形日志 (Continuous Ring)** | 三段式轮换 LogBuffer (Term Rotation) | 基于内存池的固定大小 Chunk 块管理 | 内核与用户态多层缓冲帧拷贝 | 裸字节段，无任何协议与环形抽象 |
-| **消息长度支持** | **1B ~ 4MB 动态变长 (自动填充行对齐)** | 变长分片 (支持大包重组) | 固定分块 Chunk (超大包需跨块或多段分配) | 任意长度变长帧 | 需自定义协议头与序列化 |
-| **等待与通知策略** | **混合自适应 (Pause -> Yield -> Event)** | 纯轮询 Busy Spin / 线程睡眠衰减策略 | 线程轮询 / POSIX 条件变量通知 | 内核事件驱动 (epoll / kqueue / IOCP) | 信号量 / 互斥量 / 纯自旋 |
-| **流控与慢消费者** | **三级 QoS (BLOCK / DROP_OLDEST / ISOLATE)** | 慢消费者阻塞单流所有发布者 | 队列深度限制 (KeepLast / DropOldest) | 高低水位线 (HWM) 丢弃或阻塞 | 无流控机制，需上层自行实现 |
-| **崩溃恢复与保活** | **原子位图检测僵尸进程并释放游标** | 驱动心跳保活检测并清理租约 | 运行时监控客户端崩溃并回收 Chunk | 套接字断开重连机制 | 进程崩溃易导致死锁或僵尸残留 |
-| **工程侵入与依赖** | **5 个原生源文件直编，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | C++14/17 强类型框架绑定，部署流程复杂 | 动态库/静态库引入，依赖 C++ 运行时 | 纯系统调用，开发维护成本极高 |
+| 核心设计维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
+| :--- | :--- | :--- | :--- | :--- |
+| **拓扑与通道模型** | **无中心点对多广播 / 专用RPC链路** | 单向流通道 (Stream Channel) | 发布/订阅与请求/响应服务 | 节点间套接字拓扑 (REQ/REP, PUB/SUB) |
+| **外部守护进程依赖** | **零守护进程 (Daemon-Free, 点对点直连)** | 必须独立运行 **Media Driver** 守护进程 | 必须独立运行 **RouDi** 管理中枢守护进程 | 进程内线程引擎，无外部独立守护进程 |
+| **内存组织形态** | **单一片上连续环形日志 (Continuous Ring)** | 三段式轮换 LogBuffer (Term Rotation) | 基于内存池的固定大小 Chunk 块管理 | 内核与用户态多层缓冲帧拷贝 |
+| **消息长度支持** | **1B ~ 4MB 动态变长 (自动填充行对齐)** | 变长分片 (支持大包重组) | 固定分块 Chunk (超大包需跨块或多段分配) | 任意长度变长帧 |
+| **等待与通知策略** | **混合自适应 (Pause -> Yield -> Event)** | 纯轮询 Busy Spin / 线程睡眠衰减策略 | 线程轮询 / POSIX 条件变量通知 | 内核事件驱动 (epoll / kqueue / IOCP) |
+| **流控与慢消费者** | **三级 QoS (BLOCK / DROP_OLDEST / ISOLATE)** | 慢消费者阻塞单流所有发布者 | 队列深度限制 (KeepLast / DropOldest) | 高低水位线 (HWM) 丢弃或阻塞 |
+| **崩溃恢复与保活** | **原子位图检测僵尸进程并释放游标** | 驱动心跳保活检测并清理租约 | 运行时监控客户端崩溃并回收 Chunk | 套接字断开重连机制 |
+| **工程侵入与依赖** | **5 个原生源文件直编，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | C++14/17 强类型框架绑定，部署流程复杂 | 动态库/静态库引入，依赖 C++ 运行时 |
 
 ---
 
 ### 3.2 技术规格横向对比 (Detailed Comparison Table)
 
-| 技术维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess | POSIX SHM (Raw) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **单通道点对点吞吐** | **4.51M msg/s** | ~3.50M msg/s | ~2.80M msg/s | ~0.65M msg/s | ~0.90M msg/s | ~1.50M msg/s |
-| **多接收者聚合消费吞吐** | **15.07M 交付/s** | ~8.00M 交付/s | ~6.50M 交付/s | ~0.80M 交付/s | 需加锁串行化 | 需自行实现广播 |
-| **单向端到端延迟** | **Min 100ns / P50 300ns** | ~350ns | ~400ns | 15~40 µs | 1~5 µs | 取决于自定义同步方案 |
-| **内存组织结构** | **1B ~ 4MB 连续环形日志** | 连续 LogBuffer | 固定大小 Chunk 分块 | 套接字帧内存拷贝 | 内存池或分段分配 | 连续裸内存，无协议 |
-| **QoS 背压流控** | **Block / DropOldest / Isolate** | 慢消费者阻塞发送者 | KeepLast / DropOldest | 高低水位线 (HWM) | 无 | 无 |
-| **原生跨进程同步 RPC** | **内置 (CorrelationId+专用通道)** | 无 (需自行构建协议) | 需独立配置服务通道 | REQ/REP 套接字模式 | 无 | 无 |
-| **等待策略** | **自适应 (Pause -> Yield -> Futex)** | 需配置 IdleStrategy | 轮询或信号量阻塞 | epoll 多路复用 | 互斥锁休眠或纯轮询 | 需手动实现 |
-| **空闲 CPU 占用率** | **0.0%** | 轮询打满核心 / 休眠抖动 | 轮询打满核心 / 延迟抖动 | 0% | 0% | 100% 或毫秒级休眠 |
-| **跨平台支持** | **Windows & Linux 原生支持** | 跨平台 (驱动配置繁琐) | Linux 为主 (Windows 有限) | 跨平台 | 跨平台 | 仅支持 *Nix |
-| **独立守护进程依赖** | **无 (零守护进程)** | 需独立 Media Driver 进程 | 需独立 RouDi 管理进程 | 无 | 无 | 无 |
-| **代码集成形态** | **直接引入 5 个源文件** | 依赖外部驱动与复杂构建链 | 依赖 C++ 框架与复杂配置 | 依赖动态库/静态库 | 依赖 Boost 模板库 | 仅裸系统调用 |
+| 技术维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **单通道点对点吞吐** | **4.51M msg/s** | ~3.50M msg/s | ~2.80M msg/s | ~0.65M msg/s | ~0.90M msg/s |
+| **多接收者聚合消费吞吐** | **15.07M 交付/s** | ~8.00M 交付/s | ~6.50M 交付/s | ~0.80M 交付/s | 需加锁串行化 |
+| **单向端到端延迟** | **Min 100ns / P50 300ns** | ~350ns | ~400ns | 15~40 µs | 1~5 µs |
+| **内存组织结构** | **1B ~ 4MB 连续环形日志** | 连续 LogBuffer | 固定大小 Chunk 分块 | 套接字帧内存拷贝 | 内存池或分段分配 |
+| **QoS 背压流控** | **Block / DropOldest / Isolate** | 慢消费者阻塞发送者 | KeepLast / DropOldest | 高低水位线 (HWM) | 无 |
+| **原生跨进程同步 RPC** | **内置 (CorrelationId+专用通道)** | 无 (需自行构建协议) | 需独立配置服务通道 | REQ/REP 套接字模式 | 无 |
+| **等待策略** | **自适应 (Pause -> Yield -> Futex)** | 需配置 IdleStrategy | 轮询或信号量阻塞 | epoll 多路复用 | 互斥锁休眠或纯轮询 |
+| **空闲 CPU 占用率** | **0.0%** | 轮询打满核心 / 休眠抖动 | 轮询打满核心 / 延迟抖动 | 0% | 0% |
+| **跨平台支持** | **Windows & Linux 原生支持** | 跨平台 (驱动配置繁琐) | Linux 为主 (Windows 有限) | 跨平台 | 跨平台 |
+| **独立守护进程依赖** | **无 (零守护进程)** | 需独立 Media Driver 进程 | 需独立 RouDi 管理进程 | 无 | 无 |
+| **代码集成形态** | **直接引入 5 个源文件** | 依赖外部驱动与复杂构建链 | 依赖 C++ 框架与复杂配置 | 依赖动态库/静态库 | 依赖 Boost 模板库 |
 
 ---
 
@@ -273,28 +273,6 @@ Teleport 提供完整的自动化单元测试集，覆盖并发竞争、大包�
 # Windows
 teleport.exe ut
 ```
-
-### 测试用例矩阵与结果
-
-| 测试分类 | 测试函数名 | 覆盖场景 | 验证状态 |
-| :--- | :--- | :--- | :---: |
-| **基础协议与加解密** | `UT_TestBFCrypto` | Blowfish 数据加密与解密一致性验证 | **PASS** |
-| **加解密严苛套件** | `UT_Rigor_Crypto_FullSuite` | 零长/空指针防护、全长度对齐、原地加解密、448-bit可变长密钥、ECB块原语、内存清零与8线程并发应力 | **PASS** |
-| **线程生命周期** | `UT_TestThread` | 线程创建、启动门控、同步停止与退出释放 | **PASS** |
-| **空洞追踪与游标** | `UT_TestSetUnreadHoles` / `UT_TestGetFirstAvailRecord` | 订阅者确认位图断层检测与未读空洞维护 | **PASS** |
-| **GUID 与命名映射** | `UT_TestChannelGuidConsistency` | 全局跨进程通道 GUID 生成与对象绑定一致性 | **PASS** |
-| **零丢包与顺序性** | `UT_TestMessageDeliveryNoLoss` | 多消息连续发布拉取与 FIFO 顺序校验 | **PASS** |
-| **变长包与尾部填充** | `UT_Rigor_VariableLength_BoundaryWrapping` | 变长包边界回绕、大包（>4MB）拦截及填充行对齐 | **PASS** |
-| **多线程并发写入** | `UT_Rigor_VariableLength_ConcurrentMultiThread` | 4 线程并发随机变长消息写入无冲突校验 | **PASS** |
-| **流控：严格背压** | `UT_Rigor_Policy_Block_Backpressure` | `POLICY_BLOCK` 下缓冲区满发送端阻塞及恢复 | **PASS** |
-| **流控：最新优先** | `UT_Rigor_Policy_DropOldest_Overwrite` | `POLICY_DROP_OLDEST` 跨圈覆盖与重置游标校验 | **PASS** |
-| **流控：慢消费者隔离** | `UT_Rigor_Policy_IsolateSlowConsumer` | 滞后量超限自动隔离与追赶后恢复激活状态 | **PASS** |
-| **混合自适应等待** | `UT_Rigor_AdaptiveWait_PruningAndTiming` | Spin-Pause -> Yield -> Event 三级等待时序验证 | **PASS** |
-| **同步 RPC 并发调用** | `UT_Rigor_Rpc_MultiThreadedConcurrency` | 4 线程 100 次并发同步 RPC 独立关联序列验证 | **PASS** |
-| **RPC 大载荷与截断** | `UT_Rigor_Rpc_LargePayloadAndTruncation` | 64KB 大载荷传输与缓冲区不足截断保护 | **PASS** |
-| **RPC 超时与异常** | `UT_Rigor_Rpc_TimeoutAndErrorHandling` | 服务端延时客户端熔断及错误码透传验证 | **PASS** |
-
-所有 23 项单元测试在 **Linux (Ubuntu 24.04 LTS)** 与 **Windows 10/11** 环境下均 **100% 通过**。
 
 ---
 
