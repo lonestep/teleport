@@ -27,53 +27,95 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ---
 
-## 2. Features (核心特性)
+## 2. 核心特性 / Features
 
-* **连续环形日志缓冲区 (Continuous Circular Log Buffer)**：采用类似 Aeron 架构的单一连续物理内存环形日志，支持 1 字节至 4MB 变长消息，解除固定 4KB 槽位限制；通过尾部对齐环绕填充（`LOG_RECORD_FLAG_PADDING`）与 64 字节缓存行对齐消除伪共享（False Sharing）。
-* **三级背压与 QoS 流控策略 (Three-Tier Backpressure Policies)**：
+### 核心特性
+
+* **三级背压与服务质量流控策略**：
   * `POLICY_BLOCK`（默认）：严格零丢失可靠投递，通过原子确认游标侦测最慢消费者，缓冲区满时发送端进入自适应背压；
-  * `POLICY_DROP_OLDEST`：最新优先，写游标主动覆盖最旧未读，落后消费者自动重置游标并触发丢包统计；
+  * `POLICY_DROP_OLDEST`：最新数据优先，写游标主动覆盖最旧未读消息，落后消费者自动重置游标并触发丢包统计；
   * `POLICY_ISOLATE_SLOW_CONSUMER`：动态监测下游积压量，超过滞后阈值（如 8MB）自动标记为隔离状态，防止单一慢节点阻碍主干链路。
-* **混合自适应等待策略 (Hybrid Adaptive Wait Strategy)**：三阶段平滑降级（CPU pause 自旋 -> 线程 yield 让步 -> 内核事件/Futex 阻塞），兼顾亚微秒级延迟与空闲时 0% CPU 占用。
-* **原生跨进程同步 RPC 框架 (Synchronous Cross-Process RPC)**：内置基于 64 位关联 ID（`CorrelationId`）与调用方私有专用回复通道的请求-响应机制（`RegisterRpcService` / `Call`）。
-* **零拷贝与内存屏障保障 (Zero-Copy & Memory Barriers)**：支持共享内存就地分配与提交（`AcquireBuffer` / `CommitBuffer`），消除临时堆分配与二次拷贝。
-* **多发送者与多接收者并发支持 (Multi-Producer Multi-Consumer)**：支持多进程并发发布与多进程全量订阅广播，内置原子 CRC32 数据完整性校验。
-* **无外部依赖与无守护进程 (Daemon-Free Architecture)**：全量代码仅由 5 个源文件组成（`platform.*`, `teleport.*`, `typedefs.hpp`），无需独立运行服务进程（Daemon-free），无需 Boost，兼容 C++11 及更高版本。
+* **混合自适应等待策略**：三阶段平滑降级（CPU 指令级自旋 -> 线程让步 -> 内核事件 / Futex 阻塞），兼顾亚微秒级超低延迟与空闲时零 CPU 占用。
+* **原生跨进程同步 RPC 框架**：内置基于 64 位关联标识与调用方专用回复通道的请求-响应机制（`RegisterRpcService` / `Call`）。
+* **零拷贝与内存屏障保障**：支持共享内存就地分配与提交（`AcquireBuffer` / `CommitBuffer`），消除临时堆分配与二次内存拷贝。
+* **多发送者与多接收者并发支持**：支持多进程并发发布与多进程全量订阅广播，内置原子 CRC32 数据完整性校验。
+* **无外部依赖与无独立守护进程**：全量代码仅由 5 个原生源文件组成（`platform.*`, `teleport.*`, `typedefs.hpp`），点对点直连通信，无需独立运行服务守护进程，无需 Boost 库，兼容 C++11 及更高版本。
+
+### Features
+
+* **Three-Tier Backpressure and QoS Flow Control Policies**:
+  * `POLICY_BLOCK` (Default): Strict zero-loss reliable delivery. Monitors the slowest consumer via atomic acknowledgement cursors and applies adaptive backpressure to publishers when the buffer is full.
+  * `POLICY_DROP_OLDEST`: Latest-first delivery. Writers overwrite the oldest unread records; lagging consumers automatically reset read cursors and trigger drop metrics.
+  * `POLICY_ISOLATE_SLOW_CONSUMER`: Dynamically monitors downstream lag. Consumers exceeding the threshold (e.g., 8MB) are automatically isolated, preventing a single slow node from blocking the primary pipeline.
+* **Hybrid Adaptive Wait Strategy**: Three-stage smooth degradation (CPU pause spin -> thread yield -> kernel event / Futex blocking), achieving sub-microsecond latency under load and 0% CPU utilization when idle.
+* **Native Synchronous Cross-Process RPC Framework**: Built-in request-response mechanism (`RegisterRpcService` / `Call`) with 64-bit correlation IDs and private per-caller reply channels.
+* **Zero-Copy with Memory Barrier Guarantees**: Direct in-place buffer acquisition and commitment in shared memory (`AcquireBuffer` / `CommitBuffer`), eliminating temporary heap allocations and redundant data copying.
+* **Multi-Producer Multi-Consumer (MPMC) Concurrency**: Concurrent multi-process publishing and broadcast subscribing, with built-in atomic CRC32 data integrity verification.
+* **Zero External Dependencies and Daemon-Free Architecture**: Compact codebase consisting of only 5 native source files (`platform.*`, `teleport.*`, `typedefs.hpp`). Pure peer-to-peer communication without external daemon processes or Boost dependencies, fully compatible with C++11 and newer.
 
 ---
 
-## 3. Technical Comparison Matrix (技术对比矩阵)
+## 3. 技术对比矩阵 / Technical Comparison Matrix
 
-### 3.1 核心架构与设计选型对比 (Core Architecture Comparison)
+### 3.1 核心架构与设计选型对比 / Core Architecture Comparison
 
-| 核心设计维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
+#### 核心架构与设计选型对比
+
+| 核心设计维度 | Teleport | Aeron (IPC) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
 | :--- | :--- | :--- | :--- | :--- |
-| **拓扑与通道模型** | **无中心点对多广播 / 专用RPC链路** | 单向流通道 (Stream Channel) | 发布/订阅与请求/响应服务 | 节点间套接字拓扑 (REQ/REP, PUB/SUB) |
-| **外部守护进程依赖** | **零守护进程 (Daemon-Free, 点对点直连)** | 必须独立运行 **Media Driver** 守护进程 | 必须独立运行 **RouDi** 管理中枢守护进程 | 进程内线程引擎，无外部独立守护进程 |
-| **内存组织形态** | **单一片上连续环形日志 (Continuous Ring)** | 三段式轮换 LogBuffer (Term Rotation) | 基于内存池的固定大小 Chunk 块管理 | 内核与用户态多层缓冲帧拷贝 |
-| **消息长度支持** | **1B ~ 4MB 动态变长 (自动填充行对齐)** | 变长分片 (支持大包重组) | 固定分块 Chunk (超大包需跨块或多段分配) | 任意长度变长帧 |
-| **等待与通知策略** | **混合自适应 (Pause -> Yield -> Event)** | 纯轮询 Busy Spin / 线程睡眠衰减策略 | 线程轮询 / POSIX 条件变量通知 | 内核事件驱动 (epoll / kqueue / IOCP) |
-| **流控与慢消费者** | **三级 QoS (BLOCK / DROP_OLDEST / ISOLATE)** | 慢消费者阻塞单流所有发布者 | 队列深度限制 (KeepLast / DropOldest) | 高低水位线 (HWM) 丢弃或阻塞 |
-| **崩溃恢复与保活** | **原子位图检测僵尸进程并释放游标** | 驱动心跳保活检测并清理租约 | 运行时监控客户端崩溃并回收 Chunk | 套接字断开重连机制 |
-| **工程侵入与依赖** | **5 个原生源文件直编，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | C++14/17 强类型框架绑定，部署流程复杂 | 动态库/静态库引入，依赖 C++ 运行时 |
+| **拓扑与通道模型** | **无中心点对多广播 / 专用 RPC 链路** | 单向流通道 | 发布/订阅与请求/响应服务 | 节点间套接字拓扑（请求/应答、发布/订阅） |
+| **外部服务依赖** | **零守护进程，点对点直连** | 必须独立运行 Media Driver 守护进程 | 必须独立运行 RouDi 管理中枢守护进程 | 进程内线程引擎，无外部独立守护进程 |
+| **消息长度支持** | **1 字节至 4MB 动态变长（自动行对齐填充）** | 变长分片（支持大消息重组） | 固定分块（超大包需跨块或多段分配） | 任意长度变长帧 |
+| **等待与通知策略** | **混合自适应（自旋 -> 让步 -> 内核事件阻塞）** | 纯空闲轮询 / 线程睡眠衰减策略 | 线程轮询 / 条件变量通知 | 内核事件驱动（多路复用） |
+| **流控与慢消费者** | **三级服务质量策略（严格阻塞 / 覆盖旧数据 / 隔离慢节点）** | 慢消费者阻塞单流所有发布者 | 队列深度限制（保留最新 / 丢弃最旧） | 高低水位线丢弃或阻塞 |
+| **工程引入与依赖** | **5 个原生源文件直接编译，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | 强类型框架绑定，部署与集成复杂度高 | 动态库/静态库引入，依赖外部运行时 |
+
+#### Core Architecture Comparison
+
+| Core Design Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
+| :--- | :--- | :--- | :--- | :--- |
+| **Topology & Channel Model** | **Decentralized 1-to-N Broadcast / Dedicated RPC** | Unidirectional Stream Channel | Pub/Sub and Req/Rep Services | Socket-based Topology (REQ/REP, PUB/SUB) |
+| **External Daemon Dependency** | **Daemon-Free (Direct Peer-to-Peer)** | Requires standalone **Media Driver** daemon | Requires standalone **RouDi** orchestrator daemon | In-process thread engine, no standalone daemon |
+| **Message Length Support** | **1B to 4MB dynamic variable-length (Cache-line padded)** | Fragmented variable-length (Reassembly supported) | Fixed Chunk size (Requires multi-chunk allocation) | Arbitrary variable-length frames |
+| **Wait & Notification Strategy** | **Hybrid Adaptive (Pause Spin -> Yield -> Event Block)** | Busy Spin / IdleStrategy backoff sleep | Polling / POSIX condition variable notification | Kernel event-driven (epoll / kqueue / IOCP) |
+| **Flow Control & Slow Consumers** | **Three-Tier QoS (BLOCK / DROP_OLDEST / ISOLATE)** | Slow consumer blocks all publishers on the stream | Queue depth limits (KeepLast / DropOldest) | High Water Mark (HWM) drop or block |
+| **Integration & Dependencies** | **5 native source files, zero third-party dependencies** | Heavy build dependencies, complex driver operations | C++ framework binding, complex setup process | Dynamic/static library linkage, runtime dependencies |
 
 ---
 
-### 3.2 技术规格横向对比 (Detailed Comparison Table)
+### 3.2 技术规格横向对比 / Detailed Comparison Table
 
-| 技术维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
+#### 技术规格横向对比
+
+| 技术维度 | Teleport | Aeron (IPC 模式) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **单通道点对点吞吐** | **4.51M msg/s** | ~3.50M msg/s | ~2.80M msg/s | ~0.65M msg/s | ~0.90M msg/s |
-| **多接收者聚合消费吞吐** | **15.07M 交付/s** | ~8.00M 交付/s | ~6.50M 交付/s | ~0.80M 交付/s | 需加锁串行化 |
-| **单向端到端延迟** | **Min 100ns / P50 300ns** | ~350ns | ~400ns | 15~40 µs | 1~5 µs |
-| **内存组织结构** | **1B ~ 4MB 连续环形日志** | 连续 LogBuffer | 固定大小 Chunk 分块 | 套接字帧内存拷贝 | 内存池或分段分配 |
-| **QoS 背压流控** | **Block / DropOldest / Isolate** | 慢消费者阻塞发送者 | KeepLast / DropOldest | 高低水位线 (HWM) | 无 |
-| **原生跨进程同步 RPC** | **内置 (CorrelationId+专用通道)** | 无 (需自行构建协议) | 需独立配置服务通道 | REQ/REP 套接字模式 | 无 |
-| **等待策略** | **自适应 (Pause -> Yield -> Futex)** | 需配置 IdleStrategy | 轮询或信号量阻塞 | epoll 多路复用 | 互斥锁休眠或纯轮询 |
+| **单通道点对点吞吐** | **4.51M 消息/秒** | ~3.50M 消息/秒 | ~2.80M 消息/秒 | ~0.65M 消息/秒 | ~0.90M 消息/秒 |
+| **多接收者聚合消费吞吐** | **15.07M 交付/秒** | ~8.00M 交付/秒 | ~6.50M 交付/秒 | ~0.80M 交付/秒 | 需加锁串行化 |
+| **单向端到端延迟** | **最小 100ns / 中位数 300ns** | ~350ns | ~400ns | 15 ~ 40 微秒 | 1 ~ 5 微秒 |
+| **内存组织结构** | **1 字节至 4MB 连续环形日志** | 轮换日志缓冲区 | 固定大小内存分块 | 套接字多层帧拷贝 | 进程间内存池或分段分配 |
+| **服务质量与背压流控** | **阻塞等待 / 覆盖旧数据 / 隔离慢节点** | 慢消费者阻塞发送者 | 保留最新 / 丢弃最旧 | 高低水位线丢弃或阻塞 | 无 |
+| **原生跨进程同步 RPC** | **内置（关联标识与专用通道）** | 无（需自行实现协议） | 需独立配置服务通道 | 请求/应答套接字模式 | 无 |
+| **等待与休眠策略** | **自适应（自旋 -> 让步 -> 内核阻塞）** | 需配置空闲休眠策略 | 轮询或信号量阻塞 | 内核事件多路复用 | 互斥锁休眠或纯轮询 |
 | **空闲 CPU 占用率** | **0.0%** | 轮询打满核心 / 休眠抖动 | 轮询打满核心 / 延迟抖动 | 0% | 0% |
-| **跨平台支持** | **Windows & Linux 原生支持** | 跨平台 (驱动配置繁琐) | Linux 为主 (Windows 有限) | 跨平台 | 跨平台 |
-| **独立守护进程依赖** | **无 (零守护进程)** | 需独立 Media Driver 进程 | 需独立 RouDi 管理进程 | 无 | 无 |
-| **代码集成形态** | **直接引入 5 个源文件** | 依赖外部驱动与复杂构建链 | 依赖 C++ 框架与复杂配置 | 依赖动态库/静态库 | 依赖 Boost 模板库 |
+| **跨平台支持** | **原生支持 Windows 与 Linux** | 跨平台（驱动配置繁琐） | 主支持 Linux（Windows 有限） | 跨平台 | 跨平台 |
+| **独立守护进程依赖** | **无（零守护进程）** | 需独立媒体驱动进程 | 需独立管理中枢进程 | 无 | 无 |
+| **代码集成形态** | **直接引入 5 个源文件编译** | 依赖外部驱动与复杂构建链 | 依赖强类型框架与复杂配置 | 依赖动态库或静态库 | 依赖大型模板库 |
+
+#### Detailed Comparison Table
+
+| Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **P2P Throughput (Single Channel)** | **4.51M msg/s** | ~3.50M msg/s | ~2.80M msg/s | ~0.65M msg/s | ~0.90M msg/s |
+| **Aggregate Multicast Throughput** | **15.07M delivery/s** | ~8.00M delivery/s | ~6.50M delivery/s | ~0.80M delivery/s | Serialized with mutex |
+| **One-Way Latency** | **Min 100ns / P50 300ns** | ~350ns | ~400ns | 15~40 µs | 1~5 µs |
+| **Memory Architecture** | **1B ~ 4MB continuous ring buffer** | Rotating LogBuffer terms | Fixed-size chunk pool | Multi-tier socket frame copies | Managed shm pool / segments |
+| **QoS & Backpressure** | **Block / DropOldest / Isolate** | Slow consumer blocks publisher | KeepLast / DropOldest | High Water Mark (HWM) | None |
+| **Native Synchronous RPC** | **Built-in (Correlation ID + reply channel)** | None (requires custom protocol) | Requires service channels | REQ / REP socket pattern | None |
+| **Wait Strategy** | **Adaptive (Pause -> Yield -> Futex)** | IdleStrategy backoff configuration | Polling or semaphore blocking | epoll / IOCP multiplexing | Mutex sleep or pure polling |
+| **Idle CPU Utilization** | **0.0%** | 100% spin or sleep jitter | 100% spin or latency jitter | 0% | 0% |
+| **Platform Support** | **Native Windows & Linux** | Cross-platform (complex driver setup) | Primarily Linux (limited Windows) | Cross-platform | Cross-platform |
+| **Standalone Daemon Dependency** | **None (Daemon-Free)** | Standalone Media Driver required | Standalone RouDi daemon required | None | None |
+| **Code Integration & Dependencies** | **Directly compile 5 source files** | External daemon & complex build chain | Framework bindings & complex config | Dynamic / static library linkage | Heavy template library headers |
 
 ---
 
