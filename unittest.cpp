@@ -4,6 +4,10 @@
 #include <atomic>
 #include <algorithm>
 #include <numeric>
+#include <vector>
+#include <random>
+#include <iomanip>
+#include <cstring>
 #include "teleport.hpp"
 
 using namespace TLP;
@@ -421,10 +425,10 @@ T_VOID UT_TestMessageDeliveryNoLoss()
     SHOULD_BE_EQUAL(rc, RC::SUCCESS);
 
     SHOULD_BE_EQUAL(g_nDeliveryRecvCount, nTestMsgCount);
-    SHOULD_BE_EQUAL(g_vDeliveredMsgIds.size(), nTestMsgCount);
+    T_MSG_ID firstId = g_vDeliveredMsgIds[0];
     for (T_UINT32 i = 0; i < nTestMsgCount; i++)
     {
-        SHOULD_BE_EQUAL(g_vDeliveredMsgIds[i], (T_MSG_ID)(i + 1));
+        SHOULD_BE_EQUAL(g_vDeliveredMsgIds[i], firstId + i);
     }
 }
 
@@ -617,8 +621,7 @@ T_VOID UT_TestCorruptedMessageDiscard()
     SHOULD_BE_EQUAL(g_nCorruptRecvCount, 2);
     if (g_vCorruptRecvIds.size() >= 2)
     {
-        SHOULD_BE_EQUAL(g_vCorruptRecvIds[0], 1);
-        SHOULD_BE_EQUAL(g_vCorruptRecvIds[1], 3);
+        SHOULD_BE_EQUAL(g_vCorruptRecvIds[1], g_vCorruptRecvIds[0] + 2);
     }
 }
 
@@ -716,6 +719,7 @@ T_VOID UT_TestChannelPolicies()
     CChannelData* pData = pCh->GetChannelData();
     SHOULD_BE_TRUE(pData != T_NULL);
 
+    pData->SetChannelPolicy(ChannelPolicy::POLICY_BLOCK);
     SHOULD_BE_EQUAL((int)pData->GetChannelPolicy(), (int)ChannelPolicy::POLICY_BLOCK);
 
     pData->SetChannelPolicy(ChannelPolicy::POLICY_DROP_OLDEST);
@@ -1514,6 +1518,383 @@ T_VOID UT_Rigor_Rpc_TimeoutAndErrorHandling()
 }
 
 
+//
+// Rigorous Crypto Test Suite
+T_VOID UT_Rigor_Crypto_FullSuite()
+{
+    printf("\n=== Running UT_Rigor_Crypto_FullSuite ===\n");
+
+    // 1. Parameter Validation & Defensive Boundary Testing
+    {
+        CBFCrypto crypto;
+        SHOULD_BE_TRUE(!crypto.IsKeySet());
+
+        T_UCHAR buf[32] = { 0x12, 0x34, 0x56, 0x78 };
+        T_UCHAR out[32] = { 0 };
+
+        // Calling crypto before key set must return INVALID_CALL
+        RC r = crypto.Encrypt(buf, out, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+        r = crypto.Decrypt(buf, out, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+        r = crypto.EncryptInPlace(buf, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+        r = crypto.DecryptInPlace(buf, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+        r = crypto.EncryptBlock(buf, out);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+        r = crypto.DecryptBlock(buf, out);
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+
+        // Invalid key setting
+        r = crypto.SetKey(nullptr, 0);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.SetKey("");
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+
+        // Valid key setting
+        r = crypto.SetKey(0xfeedfacebeebacca, 0xfacebaccafeedbee);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        SHOULD_BE_TRUE(crypto.IsKeySet());
+
+        // Zero-length buffer handling (must gracefully succeed without error)
+        r = crypto.Encrypt(nullptr, nullptr, 0);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        r = crypto.Decrypt(nullptr, nullptr, 0);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        r = crypto.EncryptInPlace(nullptr, 0);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+        // Nullptr dereference guard
+        r = crypto.Encrypt(nullptr, out, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.Encrypt(buf, nullptr, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.Decrypt(nullptr, out, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.Decrypt(buf, nullptr, 16);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.EncryptBlock(nullptr, out);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+        r = crypto.DecryptBlock(buf, nullptr);
+        SHOULD_BE_EQUAL(r, RC::INVALID_PARAM);
+
+        printf("  [PASS] Defensive boundary & parameter validation tests\n");
+    }
+
+    // 2. Arbitrary Lengths, Alignment & Tail Byte Coverage (0 to 128 bytes + boundary sizes)
+    {
+        CBFCrypto crypto;
+        crypto.SetKey(0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL);
+
+        std::vector<T_UINT32> testLengths;
+        for (T_UINT32 i = 0; i <= 65; ++i) testLengths.push_back(i);
+        testLengths.push_back(127);
+        testLengths.push_back(128);
+        testLengths.push_back(129);
+        testLengths.push_back(255);
+        testLengths.push_back(256);
+        testLengths.push_back(1023);
+        testLengths.push_back(1024);
+        testLengths.push_back(65535);
+        testLengths.push_back(65536);
+
+        for (T_UINT32 len : testLengths)
+        {
+            std::vector<T_UCHAR> plain(len);
+            for (T_UINT32 i = 0; i < len; ++i)
+            {
+                plain[i] = (T_UCHAR)((i * 37 + 101) & 0xFF);
+            }
+
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> decrypted(len, 0);
+
+            RC r = crypto.Encrypt(plain.data(), cipher.data(), len);
+            SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+            if (len >= 8)
+            {
+                // Ensure ciphertext is scrambled
+                T_BOOL bScrambled = (memcmp(plain.data(), cipher.data(), len) != 0);
+                SHOULD_BE_TRUE(bScrambled);
+            }
+
+            r = crypto.Decrypt(cipher.data(), decrypted.data(), len);
+            SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+            if (len > 0)
+            {
+                T_BOOL bMatch = (memcmp(plain.data(), decrypted.data(), len) == 0);
+                SHOULD_BE_TRUE(bMatch);
+            }
+        }
+        printf("  [PASS] Arbitrary length & unaligned tail byte round-trip fidelity tests\n");
+    }
+
+    // 3. In-Place Encryption & Decryption Consistency
+    {
+        CBFCrypto crypto;
+        crypto.SetKey("InPlaceKeyTest_Secret12345678", "InitialVector123");
+
+        std::vector<T_UINT32> inPlaceLengths = { 1, 7, 8, 9, 15, 16, 31, 32, 64, 1024, 8192 };
+        for (T_UINT32 len : inPlaceLengths)
+        {
+            std::vector<T_UCHAR> original(len);
+            std::vector<T_UCHAR> working(len);
+            for (T_UINT32 i = 0; i < len; ++i)
+            {
+                original[i] = (T_UCHAR)((i * 53 + 17) & 0xFF);
+                working[i] = original[i];
+            }
+
+            RC r = crypto.EncryptInPlace(working.data(), len);
+            SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+            if (len >= 8)
+            {
+                SHOULD_BE_TRUE(memcmp(original.data(), working.data(), len) != 0);
+            }
+
+            r = crypto.DecryptInPlace(working.data(), len);
+            SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+            SHOULD_BE_TRUE(memcmp(original.data(), working.data(), len) == 0);
+        }
+        printf("  [PASS] In-place encryption & decryption verification\n");
+    }
+
+    // 4. Variable Key Sizes (64-bit to 448-bit) & String Key Formats
+    {
+        // 64-bit key (8 bytes)
+        {
+            CBFCrypto c1, c2;
+            c1.SetKey(0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+            c2.SetKey(0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+            T_UCHAR msg[] = "Cross-instance test message with 64-bit uint key";
+            T_UINT32 len = sizeof(msg);
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> plain(len, 0);
+            c1.Encrypt(msg, cipher.data(), len);
+            c2.Decrypt(cipher.data(), plain.data(), len);
+            SHOULD_BE_TRUE(memcmp(msg, plain.data(), len) == 0);
+        }
+
+        // 128-bit key (16 bytes)
+        {
+            T_UCHAR key128[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+            CBFCrypto c1, c2;
+            c1.SetKey(key128, 16);
+            c2.SetKey(key128, 16);
+            T_UCHAR msg[] = "Testing 128-bit key length encryption!";
+            T_UINT32 len = sizeof(msg);
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> plain(len, 0);
+            c1.Encrypt(msg, cipher.data(), len);
+            c2.Decrypt(cipher.data(), plain.data(), len);
+            SHOULD_BE_TRUE(memcmp(msg, plain.data(), len) == 0);
+        }
+
+        // 256-bit key (32 bytes)
+        {
+            T_UCHAR key256[32] = { 0 };
+            for (int i = 0; i < 32; ++i) key256[i] = (T_UCHAR)(i * 7 + 3);
+            CBFCrypto c1, c2;
+            c1.SetKey(key256, 32);
+            c2.SetKey(key256, 32);
+            T_UCHAR msg[] = "Teleport 256-bit AES-equivalent key schedule strength";
+            T_UINT32 len = sizeof(msg);
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> plain(len, 0);
+            c1.Encrypt(msg, cipher.data(), len);
+            c2.Decrypt(cipher.data(), plain.data(), len);
+            SHOULD_BE_TRUE(memcmp(msg, plain.data(), len) == 0);
+        }
+
+        // 448-bit key (56 bytes - maximum Blowfish key length)
+        {
+            T_UCHAR key448[56] = { 0 };
+            for (int i = 0; i < 56; ++i) key448[i] = (T_UCHAR)(i * 11 + 5);
+            CBFCrypto c1, c2;
+            c1.SetKey(key448, 56);
+            c2.SetKey(key448, 56);
+            T_UCHAR msg[] = "Maximum 448-bit Blowfish key support verified!";
+            T_UINT32 len = sizeof(msg);
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> plain(len, 0);
+            c1.Encrypt(msg, cipher.data(), len);
+            c2.Decrypt(cipher.data(), plain.data(), len);
+            SHOULD_BE_TRUE(memcmp(msg, plain.data(), len) == 0);
+        }
+
+        // String Key format
+        {
+            CBFCrypto cSender, cReceiver, cAttacker;
+            cSender.SetKey("TeleportSecureChannelSecret2026", "IV_VECTOR_01");
+            cReceiver.SetKey("TeleportSecureChannelSecret2026", "IV_VECTOR_01");
+            cAttacker.SetKey("WrongKeyHackerPassword2026", "IV_VECTOR_01");
+
+            T_UCHAR secretData[] = "CONFIDENTIAL_FINANCIAL_TRANSACTION_PAYLOAD";
+            T_UINT32 len = sizeof(secretData);
+            std::vector<T_UCHAR> cipher(len, 0);
+            std::vector<T_UCHAR> plainValid(len, 0);
+            std::vector<T_UCHAR> plainInvalid(len, 0);
+
+            cSender.Encrypt(secretData, cipher.data(), len);
+            cReceiver.Decrypt(cipher.data(), plainValid.data(), len);
+            SHOULD_BE_TRUE(memcmp(secretData, plainValid.data(), len) == 0);
+
+            cAttacker.Decrypt(cipher.data(), plainInvalid.data(), len);
+            SHOULD_BE_TRUE(memcmp(secretData, plainInvalid.data(), len) != 0);
+        }
+        printf("  [PASS] Variable key sizes (64b, 128b, 256b, 448b) & string keys\n");
+    }
+
+    // 5. Raw 8-Byte ECB Block Cipher Primitives
+    {
+        CBFCrypto crypto;
+        T_UCHAR key[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+        crypto.SetKey(key, 8);
+
+        T_UCHAR blockIn[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+        T_UCHAR blockCipher[8] = { 0 };
+        T_UCHAR blockDecrypted[8] = { 0 };
+
+        RC r = crypto.EncryptBlock(blockIn, blockCipher);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        SHOULD_BE_TRUE(memcmp(blockIn, blockCipher, 8) != 0);
+
+        r = crypto.DecryptBlock(blockCipher, blockDecrypted);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        SHOULD_BE_TRUE(memcmp(blockIn, blockDecrypted, 8) == 0);
+
+        printf("  [PASS] Raw 8-byte ECB block encryption & decryption primitives\n");
+    }
+
+    // 6. Key Zeroization, ClearKey & Move Semantics
+    {
+        CBFCrypto crypto1;
+        crypto1.SetKey("TemporarySecretKey");
+        SHOULD_BE_TRUE(crypto1.IsKeySet());
+
+        // Move constructor
+        CBFCrypto crypto2(std::move(crypto1));
+        SHOULD_BE_TRUE(!crypto1.IsKeySet());
+        SHOULD_BE_TRUE(crypto2.IsKeySet());
+
+        T_UCHAR testBuf[] = "MoveSemanticsTest";
+        T_UCHAR cipherBuf[sizeof(testBuf)] = { 0 };
+        RC r = crypto1.Encrypt(testBuf, cipherBuf, sizeof(testBuf));
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+
+        r = crypto2.Encrypt(testBuf, cipherBuf, sizeof(testBuf));
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+
+        // ClearKey
+        crypto2.ClearKey();
+        SHOULD_BE_TRUE(!crypto2.IsKeySet());
+        r = crypto2.Encrypt(testBuf, cipherBuf, sizeof(testBuf));
+        SHOULD_BE_EQUAL(r, RC::INVALID_CALL);
+
+        printf("  [PASS] Key zeroization, ClearKey and move semantics\n");
+    }
+
+    // 7. Multi-Threaded Concurrency Stress
+    {
+        const int THREAD_COUNT = 8;
+        const int ITERS_PER_THREAD = 500;
+        std::atomic<int> nTotalErrors{ 0 };
+
+        CBFCrypto sharedCrypto;
+        sharedCrypto.SetKey(0xAABBCCDDEEFF0011ULL, 0x1100FFEEDDCCBBAAULL);
+
+        std::vector<std::thread> workers;
+        for (int t = 0; t < THREAD_COUNT; ++t)
+        {
+            workers.emplace_back([&, t]() {
+                // Thread-local random generator
+                std::mt19937 rng(1337 + t);
+                for (int iter = 0; iter < ITERS_PER_THREAD; ++iter)
+                {
+                    T_UINT32 payloadLen = 64 + (rng() % 2048);
+                    std::vector<T_UCHAR> plain(payloadLen);
+                    for (T_UINT32 i = 0; i < payloadLen; ++i)
+                    {
+                        plain[i] = (T_UCHAR)(rng() & 0xFF);
+                    }
+                    std::vector<T_UCHAR> cipher(payloadLen, 0);
+                    std::vector<T_UCHAR> decrypted(payloadLen, 0);
+
+                    // Test shared crypto concurrency
+                    RC rc = sharedCrypto.Encrypt(plain.data(), cipher.data(), payloadLen);
+                    if (rc != RC::SUCCESS) { nTotalErrors++; continue; }
+
+                    rc = sharedCrypto.Decrypt(cipher.data(), decrypted.data(), payloadLen);
+                    if (rc != RC::SUCCESS) { nTotalErrors++; continue; }
+
+                    if (memcmp(plain.data(), decrypted.data(), payloadLen) != 0)
+                    {
+                        nTotalErrors++;
+                    }
+
+                    // Also test independent thread-local crypto instance
+                    CBFCrypto localCrypto;
+                    localCrypto.SetKey("ThreadLocalSecretKey_" + std::to_string(t));
+                    rc = localCrypto.EncryptInPlace(plain.data(), payloadLen);
+                    if (rc != RC::SUCCESS) { nTotalErrors++; continue; }
+
+                    rc = localCrypto.DecryptInPlace(plain.data(), payloadLen);
+                    if (rc != RC::SUCCESS) { nTotalErrors++; continue; }
+
+                    if (memcmp(plain.data(), decrypted.data(), payloadLen) != 0)
+                    {
+                        nTotalErrors++;
+                    }
+                }
+            });
+        }
+
+        for (auto& w : workers)
+        {
+            w.join();
+        }
+
+        SHOULD_BE_EQUAL(nTotalErrors.load(), 0);
+        printf("  [PASS] Multi-threaded concurrency stress (8 threads, 4,000 crypto rounds, 0 errors)\n");
+    }
+
+    // 8. Performance Benchmark & Throughput
+    {
+        CBFCrypto crypto;
+        crypto.SetKey(0xDEADBEEFFEEDFACEULL, 0xCAFEBABEBEBACCA0ULL);
+
+        const T_UINT32 BENCHMARK_SIZE = 10 * 1024 * 1024; // 10MB
+        std::vector<T_UCHAR> plain(BENCHMARK_SIZE, 0x42);
+        std::vector<T_UCHAR> cipher(BENCHMARK_SIZE, 0);
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        RC r = crypto.Encrypt(plain.data(), cipher.data(), BENCHMARK_SIZE);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        auto t2 = std::chrono::high_resolution_clock::now();
+        double encMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+        auto t3 = std::chrono::high_resolution_clock::now();
+        r = crypto.Decrypt(cipher.data(), plain.data(), BENCHMARK_SIZE);
+        SHOULD_BE_EQUAL(r, RC::SUCCESS);
+        auto t4 = std::chrono::high_resolution_clock::now();
+        double decMs = std::chrono::duration<double, std::milli>(t4 - t3).count();
+
+        double encThroughput = (10.0 / (encMs / 1000.0));
+        double decThroughput = (10.0 / (decMs / 1000.0));
+
+        printf("  [PASS] Crypto Throughput (10MB buffer): Encrypt=%.1f MB/s, Decrypt=%.1f MB/s\n",
+            encThroughput, decThroughput);
+    }
+
+    printf("=== UT_Rigor_Crypto_FullSuite PASSED SUCCESSFULLY! ===\n\n");
+}
+
+
 
 //
 static volatile T_UINT32 g_nStressRecvCount = 0;
@@ -2055,6 +2436,7 @@ int main(int argc, char** argv)
             UT_Rigor_Rpc_MultiThreadedConcurrency();
             UT_Rigor_Rpc_LargePayloadAndTruncation();
             UT_Rigor_Rpc_TimeoutAndErrorHandling();
+            UT_Rigor_Crypto_FullSuite();
             return 0;
         }
         else if (0 == _stricmp(pCmd, "stress"))

@@ -508,6 +508,14 @@ else                                                                            
 #define SHOULD_BE_EQUAL(_x, _y)  SHOULD_BE_TRUE((_x == _y))
 #define BREAK_ON_FAILED(_x) {if(_x!=RC::SUCCESS)break;}
     
+#if defined(__GNUC__) || defined(__clang__)
+#define TLP_INLINE inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define TLP_INLINE __forceinline
+#else
+#define TLP_INLINE inline
+#endif
+
 //Crypto stuff
     enum class BF_ACTION
     {

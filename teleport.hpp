@@ -219,16 +219,43 @@ namespace TLP
     class CBFCrypto
     {
     public:
+        CBFCrypto();
+        virtual ~CBFCrypto();
 
+        // Non-copyable, but movable
+        CBFCrypto(const CBFCrypto&) = delete;
+        CBFCrypto& operator=(const CBFCrypto&) = delete;
+        CBFCrypto(CBFCrypto&& other) noexcept;
+        CBFCrypto& operator=(CBFCrypto&& other) noexcept;
+
+        // Singleton instance (for backward compatibility)
         static CBFCrypto& Instance();
+
+        // Key configuration methods
         RC    SetKey(T_UINT64 ullKey, T_UINT64 ullIvec = BF_DEFAULT_IVEC);
+        RC    SetKey(const T_UCHAR* pKey, T_UINT32 nKeyLen, const T_UCHAR* pIvec = nullptr);
+        RC    SetKey(const std::string& strKey, const std::string& strIvec = "");
+
+        // Key management & query
+        RC    ClearKey();
+        T_BOOL IsKeySet() const;
+
+        // CFB-64 stream encryption and decryption
         RC    Encrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByte);
         RC    Decrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByte);
 
+        // In-place encryption and decryption
+        RC    EncryptInPlace(T_PUCHAR pData, T_UINT32 nLengthInByte);
+        RC    DecryptInPlace(T_PUCHAR pData, T_UINT32 nLengthInByte);
+
+        // 8-byte block ECB cipher primitives
+        RC    EncryptBlock(T_PCUCHAR pInBlock, T_PUCHAR pOutBlock);
+        RC    DecryptBlock(T_PCUCHAR pInBlock, T_PUCHAR pOutBlock);
+
     protected:
         T_VOID BF_set_key(BF_KEY* pKey, T_UINT32 nLen, T_PCUCHAR pData);
-        T_VOID BF_encrypt(BF_LONG* data, const BF_KEY* key);
-        T_VOID BF_decrypt(BF_LONG* data, const BF_KEY* key);
+        static T_VOID BF_encrypt(BF_LONG* data, const BF_KEY* key);
+        static T_VOID BF_decrypt(BF_LONG* data, const BF_KEY* key);
         T_VOID BF_cfb64_encrypt(T_PCUCHAR pInData,
             T_PUCHAR pOutData,
             T_UINT32 nLength,
@@ -238,8 +265,6 @@ namespace TLP
             BF_ACTION eAction);
 
     private:
-        CBFCrypto();
-        virtual ~CBFCrypto() {};
         T_UINT64    m_ullIvec;
         T_INT32     m_nNum;
         BF_KEY      m_Key;

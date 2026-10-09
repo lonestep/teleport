@@ -2223,7 +2223,7 @@ RC CChannelData::Realloc(T_UINT32 nSizeInByte)
 
 
 //
-T_VOID CBFCrypto::BF_encrypt(BF_LONG* data, const BF_KEY* key)
+TLP_INLINE T_VOID CBFCrypto::BF_encrypt(BF_LONG* data, const BF_KEY* key)
 {
     BF_LONG l, r;
     const BF_LONG* p, * s;
@@ -2256,7 +2256,7 @@ T_VOID CBFCrypto::BF_encrypt(BF_LONG* data, const BF_KEY* key)
     data[0] = r & 0xffffffffU;
 }
 
-T_VOID CBFCrypto::BF_decrypt(BF_LONG* data, const BF_KEY* key)
+TLP_INLINE T_VOID CBFCrypto::BF_decrypt(BF_LONG* data, const BF_KEY* key)
 {
     BF_LONG l, r;
     const BF_LONG* p, * s;
@@ -2298,67 +2298,158 @@ T_VOID CBFCrypto::BF_cfb64_encrypt(T_PCUCHAR in,
     T_PINT32 num,
     BF_ACTION eAction)
 {
-    BF_LONG v0, v1, t;
     int n = *num;
     long l = length;
     BF_LONG ti[2];
-    unsigned char* iv, c, cc;
+    unsigned char* iv = (unsigned char*)ivec;
 
+    BF_LONG v0, v1, t;
+    n2l(iv, v0);
+    ti[0] = v0;
+    n2l(iv, v1);
+    ti[1] = v1;
     iv = (unsigned char*)ivec;
+
     if (eAction == BF_ACTION::BF_ENCRYPT) {
-        while (l--) {
-            if (n == 0) {
-                n2l(iv, v0);
-                ti[0] = v0;
-                n2l(iv, v1);
-                ti[1] = v1;
-                BF_encrypt((BF_LONG*)ti, schedule);
-                iv = (unsigned char*)ivec;
-                t = ti[0];
-                l2n(t, iv);
-                t = ti[1];
-                l2n(t, iv);
-                iv = (unsigned char*)ivec;
+        // Step 1: Finish partial block if n != 0
+        if (n != 0) {
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
+            iv = (unsigned char*)ivec;
+            while (l && n != 0) {
+                unsigned char c = *(in++) ^ iv[n];
+                *(out++) = c;
+                iv[n] = c;
+                n = (n + 1) & 0x07;
+                l--;
             }
-            c = *(in++) ^ iv[n];
-            *(out++) = c;
-            iv[n] = c;
-            n = (n + 1) & 0x07;
+            n2l(iv, v0); ti[0] = v0;
+            n2l(iv, v1); ti[1] = v1;
+            iv = (unsigned char*)ivec;
+        }
+
+        // Step 2: Fast 8-byte full blocks pipeline
+        while (l >= 8) {
+            BF_encrypt(ti, schedule);
+            BF_LONG d0, d1;
+            n2l(in, d0);
+            n2l(in, d1);
+            d0 ^= ti[0];
+            d1 ^= ti[1];
+            l2n(d0, out);
+            l2n(d1, out);
+            ti[0] = d0;
+            ti[1] = d1;
+            l -= 8;
+        }
+
+        // Step 3: Handle remaining tail bytes (0..7)
+        if (l > 0) {
+            BF_encrypt(ti, schedule);
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
+            iv = (unsigned char*)ivec;
+            while (l--) {
+                unsigned char c = *(in++) ^ iv[n];
+                *(out++) = c;
+                iv[n] = c;
+                n = (n + 1) & 0x07;
+            }
+        } else {
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
         }
     }
     else {
-        while (l--) {
-            if (n == 0) {
-                n2l(iv, v0);
-                ti[0] = v0;
-                n2l(iv, v1);
-                ti[1] = v1;
-                BF_encrypt((BF_LONG*)ti, schedule);
-                iv = (unsigned char*)ivec;
-                t = ti[0];
-                l2n(t, iv);
-                t = ti[1];
-                l2n(t, iv);
-                iv = (unsigned char*)ivec;
+        // Decrypt
+        // Step 1: Finish partial block if n != 0
+        if (n != 0) {
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
+            iv = (unsigned char*)ivec;
+            while (l && n != 0) {
+                unsigned char cc = *(in++);
+                unsigned char c = iv[n];
+                iv[n] = cc;
+                *(out++) = c ^ cc;
+                n = (n + 1) & 0x07;
+                l--;
             }
-            cc = *(in++);
-            c = iv[n];
-            iv[n] = cc;
-            *(out++) = c ^ cc;
-            n = (n + 1) & 0x07;
+            n2l(iv, v0); ti[0] = v0;
+            n2l(iv, v1); ti[1] = v1;
+            iv = (unsigned char*)ivec;
+        }
+
+        // Step 2: Fast 8-byte full blocks pipeline
+        while (l >= 8) {
+            BF_encrypt(ti, schedule);
+            BF_LONG c0, c1;
+            n2l(in, c0);
+            n2l(in, c1);
+            BF_LONG p0 = c0 ^ ti[0];
+            BF_LONG p1 = c1 ^ ti[1];
+            l2n(p0, out);
+            l2n(p1, out);
+            ti[0] = c0;
+            ti[1] = c1;
+            l -= 8;
+        }
+
+        // Step 3: Handle remaining tail bytes (0..7)
+        if (l > 0) {
+            BF_encrypt(ti, schedule);
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
+            iv = (unsigned char*)ivec;
+            while (l--) {
+                unsigned char cc = *(in++);
+                unsigned char c = iv[n];
+                iv[n] = cc;
+                *(out++) = c ^ cc;
+                n = (n + 1) & 0x07;
+            }
+        } else {
+            t = ti[0]; l2n(t, iv);
+            t = ti[1]; l2n(t, iv);
         }
     }
-    v0 = v1 = ti[0] = ti[1] = t = c = cc = 0;
     *num = n;
 }
 
 
 //
-CBFCrypto::CBFCrypto():m_bKeySet(T_FALSE),m_ullIvec(BF_DEFAULT_IVEC)
+CBFCrypto::CBFCrypto() : m_ullIvec(BF_DEFAULT_IVEC), m_nNum(0), m_bKeySet(T_FALSE)
 {
     memset(&m_Key, 0, sizeof(BF_KEY));
 }
 
+CBFCrypto::~CBFCrypto()
+{
+    ClearKey();
+}
+
+CBFCrypto::CBFCrypto(CBFCrypto&& other) noexcept
+{
+    m_ullIvec = other.m_ullIvec;
+    m_nNum = other.m_nNum;
+    m_bKeySet = other.m_bKeySet;
+    memcpy(&m_Key, &other.m_Key, sizeof(BF_KEY));
+    other.ClearKey();
+}
+
+CBFCrypto& CBFCrypto::operator=(CBFCrypto&& other) noexcept
+{
+    if (this != &other)
+    {
+        ClearKey();
+        m_ullIvec = other.m_ullIvec;
+        m_nNum = other.m_nNum;
+        m_bKeySet = other.m_bKeySet;
+        memcpy(&m_Key, &other.m_Key, sizeof(BF_KEY));
+        other.ClearKey();
+    }
+    return *this;
+}
 
 //
 RC CBFCrypto::SetKey(T_UINT64 ullKey, T_UINT64 ullIvec)
@@ -2369,6 +2460,55 @@ RC CBFCrypto::SetKey(T_UINT64 ullKey, T_UINT64 ullIvec)
     return RC::SUCCESS;
 }
 
+RC CBFCrypto::SetKey(const T_UCHAR* pKey, T_UINT32 nKeyLen, const T_UCHAR* pIvec)
+{
+    if (!pKey || nKeyLen == 0)
+    {
+        return RC::INVALID_PARAM;
+    }
+    BF_set_key(&m_Key, nKeyLen, pKey);
+    if (pIvec)
+    {
+        memcpy(&m_ullIvec, pIvec, sizeof(T_UINT64));
+    }
+    else
+    {
+        m_ullIvec = BF_DEFAULT_IVEC;
+    }
+    m_bKeySet = T_TRUE;
+    return RC::SUCCESS;
+}
+
+RC CBFCrypto::SetKey(const std::string& strKey, const std::string& strIvec)
+{
+    if (strKey.empty())
+    {
+        return RC::INVALID_PARAM;
+    }
+    const T_UCHAR* pIv = nullptr;
+    T_UINT64 ivBuf = BF_DEFAULT_IVEC;
+    if (!strIvec.empty())
+    {
+        memset(&ivBuf, 0, sizeof(ivBuf));
+        memcpy(&ivBuf, strIvec.data(), std::min(sizeof(ivBuf), strIvec.size()));
+        pIv = (const T_UCHAR*)&ivBuf;
+    }
+    return SetKey((const T_UCHAR*)strKey.data(), (T_UINT32)strKey.size(), pIv);
+}
+
+RC CBFCrypto::ClearKey()
+{
+    memset(&m_Key, 0, sizeof(BF_KEY));
+    m_ullIvec = BF_DEFAULT_IVEC;
+    m_nNum = 0;
+    m_bKeySet = T_FALSE;
+    return RC::SUCCESS;
+}
+
+T_BOOL CBFCrypto::IsKeySet() const
+{
+    return m_bKeySet;
+}
 
 //
 CBFCrypto& CBFCrypto::Instance()
@@ -2377,10 +2517,17 @@ CBFCrypto& CBFCrypto::Instance()
     return _cbf_crypto_inst;
 }
 
-
 //
 RC CBFCrypto::Encrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByte)
 {
+    if (nLengthInByte == 0)
+    {
+        return RC::SUCCESS;
+    }
+    if (!pInData || !pOutData)
+    {
+        return RC::INVALID_PARAM;
+    }
     if (!m_bKeySet) 
     {
         return RC::INVALID_CALL;
@@ -2391,10 +2538,17 @@ RC CBFCrypto::Encrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByt
     return RC::SUCCESS;
 }
 
-
 //
 RC CBFCrypto::Decrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByte)
 {
+    if (nLengthInByte == 0)
+    {
+        return RC::SUCCESS;
+    }
+    if (!pInData || !pOutData)
+    {
+        return RC::INVALID_PARAM;
+    }
     if (!m_bKeySet)
     {
         return RC::INVALID_CALL;
@@ -2405,11 +2559,65 @@ RC CBFCrypto::Decrypt(T_PUCHAR pInData, T_PUCHAR pOutData, T_UINT32 nLengthInByt
     return RC::SUCCESS;
 }
 
+RC CBFCrypto::EncryptInPlace(T_PUCHAR pData, T_UINT32 nLengthInByte)
+{
+    return Encrypt(pData, pData, nLengthInByte);
+}
+
+RC CBFCrypto::DecryptInPlace(T_PUCHAR pData, T_UINT32 nLengthInByte)
+{
+    return Decrypt(pData, pData, nLengthInByte);
+}
+
+RC CBFCrypto::EncryptBlock(T_PCUCHAR pInBlock, T_PUCHAR pOutBlock)
+{
+    if (!m_bKeySet)
+    {
+        return RC::INVALID_CALL;
+    }
+    if (!pInBlock || !pOutBlock)
+    {
+        return RC::INVALID_PARAM;
+    }
+    const unsigned char* in = (const unsigned char*)pInBlock;
+    unsigned char* out = (unsigned char*)pOutBlock;
+    BF_LONG ti[2];
+    n2l(in, ti[0]);
+    n2l(in, ti[1]);
+    BF_encrypt(ti, &m_Key);
+    l2n(ti[0], out);
+    l2n(ti[1], out);
+    return RC::SUCCESS;
+}
+
+RC CBFCrypto::DecryptBlock(T_PCUCHAR pInBlock, T_PUCHAR pOutBlock)
+{
+    if (!m_bKeySet)
+    {
+        return RC::INVALID_CALL;
+    }
+    if (!pInBlock || !pOutBlock)
+    {
+        return RC::INVALID_PARAM;
+    }
+    const unsigned char* in = (const unsigned char*)pInBlock;
+    unsigned char* out = (unsigned char*)pOutBlock;
+    BF_LONG ti[2];
+    n2l(in, ti[0]);
+    n2l(in, ti[1]);
+    BF_decrypt(ti, &m_Key);
+    l2n(ti[0], out);
+    l2n(ti[1], out);
+    return RC::SUCCESS;
+}
 
 //
 T_VOID CBFCrypto::BF_set_key(BF_KEY* pKey, T_UINT32 nLen, T_PCUCHAR pData)
 {
-
+    if (!pKey || !pData || nLen == 0)
+    {
+        return;
+    }
     T_INT32 i;
     BF_LONG* p, ri, in[2];
     T_PCUCHAR d, end;

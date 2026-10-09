@@ -44,13 +44,18 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ## 3. Technical Comparison Matrix (技术对比矩阵)
 
-### 3.1 核心架构对比图表 (Comparison Diagrams)
+### 3.1 核心架构与设计选型对比 (Core Architecture Comparison)
 
-#### English Architecture Matrix
-![Teleport Technical Comparison Matrix (English)](docs/comparison_matrix_en.png)
-
-#### 中文核心架构对比图
-![Teleport 核心维度技术对比矩阵 (中文)](docs/comparison_matrix_zh.png)
+| 核心设计维度 / Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG | POSIX shm (Raw) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **拓扑与通道模型** | **无中心点对多广播 / 专用RPC链路** | 单向流通道 (Stream Channel) | 发布/订阅与请求/响应服务 | 节点间套接字拓扑 (REQ/REP, PUB/SUB) | 裸共享内存段，需自行规划寻址 |
+| **外部守护进程依赖** | **零守护进程 (Daemon-Free, 点对点直连)** | 必须独立运行 **Media Driver** 守护进程 | 必须独立运行 **RouDi** 管理中枢守护进程 | 进程内线程引擎，无外部独立守护进程 | 无外部守护进程 |
+| **内存组织形态** | **单一片上连续环形日志 (Continuous Ring)** | 三段式轮换 LogBuffer (Term Rotation) | 基于内存池的固定大小 Chunk 块管理 | 内核与用户态多层缓冲帧拷贝 | 裸字节段，无任何协议与环形抽象 |
+| **消息长度支持** | **1B ~ 4MB 动态变长 (自动填充行对齐)** | 变长分片 (支持大包重组) | 固定分块 Chunk (超大包需跨块或多段分配) | 任意长度变长帧 | 需自定义协议头与序列化 |
+| **等待与通知策略** | **混合自适应 (Pause -> Yield -> Event)** | 纯轮询 Busy Spin / 线程睡眠衰减策略 | 线程轮询 / POSIX 条件变量通知 | 内核事件驱动 (epoll / kqueue / IOCP) | 信号量 / 互斥量 / 纯自旋 |
+| **流控与慢消费者** | **三级 QoS (BLOCK / DROP_OLDEST / ISOLATE)** | 慢消费者阻塞单流所有发布者 | 队列深度限制 (KeepLast / DropOldest) | 高低水位线 (HWM) 丢弃或阻塞 | 无流控机制，需上层自行实现 |
+| **崩溃恢复与保活** | **原子位图检测僵尸进程并释放游标** | 驱动心跳保活检测并清理租约 | 运行时监控客户端崩溃并回收 Chunk | 套接字断开重连机制 | 进程崩溃易导致死锁或僵尸残留 |
+| **工程侵入与依赖** | **5 个原生源文件直编，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | C++14/17 强类型框架绑定，部署流程复杂 | 动态库/静态库引入，依赖 C++ 运行时 | 纯系统调用，开发维护成本极高 |
 
 ---
 
@@ -274,6 +279,7 @@ teleport.exe ut
 | 测试分类 | 测试函数名 | 覆盖场景 | 验证状态 |
 | :--- | :--- | :--- | :---: |
 | **基础协议与加解密** | `UT_TestBFCrypto` | Blowfish 数据加密与解密一致性验证 | **PASS** |
+| **加解密严苛套件** | `UT_Rigor_Crypto_FullSuite` | 零长/空指针防护、全长度对齐、原地加解密、448-bit可变长密钥、ECB块原语、内存清零与8线程并发应力 | **PASS** |
 | **线程生命周期** | `UT_TestThread` | 线程创建、启动门控、同步停止与退出释放 | **PASS** |
 | **空洞追踪与游标** | `UT_TestSetUnreadHoles` / `UT_TestGetFirstAvailRecord` | 订阅者确认位图断层检测与未读空洞维护 | **PASS** |
 | **GUID 与命名映射** | `UT_TestChannelGuidConsistency` | 全局跨进程通道 GUID 生成与对象绑定一致性 | **PASS** |
@@ -288,7 +294,7 @@ teleport.exe ut
 | **RPC 大载荷与截断** | `UT_Rigor_Rpc_LargePayloadAndTruncation` | 64KB 大载荷传输与缓冲区不足截断保护 | **PASS** |
 | **RPC 超时与异常** | `UT_Rigor_Rpc_TimeoutAndErrorHandling` | 服务端延时客户端熔断及错误码透传验证 | **PASS** |
 
-所有 22 项单元测试在 **Linux (Ubuntu 24.04 LTS)** 与 **Windows 10/11** 环境下均 **100% 通过**。
+所有 23 项单元测试在 **Linux (Ubuntu 24.04 LTS)** 与 **Windows 10/11** 环境下均 **100% 通过**。
 
 ---
 
