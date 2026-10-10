@@ -309,7 +309,7 @@ namespace TLP
         static RC CommitBuffer(T_ID nChannelId, T_UINT64 nToken, T_UINT32 nSizeInByte = 0);
 
         //
-        // Optimization 2: Channel Policy & Flow Control APIs
+        // Channel Policy & Flow Control APIs
         //
         static RC SetChannelPolicy(T_ID nChannelId, ChannelPolicy ePolicy, T_UINT32 nLagThreshold = 0);
         static RC GetChannelPolicy(T_ID nChannelId, ChannelPolicy& ePolicy, T_UINT32& nLagThreshold);
@@ -322,7 +322,7 @@ namespace TLP
         static RC Close(T_ID nChannelId, T_BOOL bSendMsgBeforeClose = T_FALSE);
 
         //
-        // Optimization 4: Cross-Process RPC (Request-Response) APIs
+        // Cross-Process RPC (Request-Response) APIs
         //
         static RC RegisterRpcService(T_PCSTR strTopic, TLP_RPC_HANDLER pHandler, T_BOOL bGlobal = T_FALSE);
         static RC UnregisterRpcService(T_PCSTR strTopic);

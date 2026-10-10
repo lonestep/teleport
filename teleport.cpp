@@ -117,7 +117,7 @@ struct RpcPendingCall
 {
     std::mutex mtx;
     std::condition_variable cv;
-    bool completed = false;
+    std::atomic<bool> completed{ false };
     RC status = RC::TIMEOUT;
     std::vector<uint8_t> respData;
 };
@@ -157,10 +157,15 @@ static RC RpcServerCallback(PTCbMessage pMsg)
     const void* pReqBody = (const void*)((const char*)pMsg->pData + sizeof(TRpcEnvelope));
     T_UINT32 nReqBodyLen = pEnv->nBodyLength;
 
-    std::vector<uint8_t> respBuffer(1024 * 1024);
+    thread_local std::vector<uint8_t> respBuffer(1024 * 1024);
     T_UINT32 nRespLen = (T_UINT32)respBuffer.size();
 
     RC rc = handler(pReqBody, nReqBodyLen, respBuffer.data(), nRespLen);
+    if (rc == RC::EXCEED_LIMIT && nRespLen > respBuffer.size())
+    {
+        respBuffer.resize(nRespLen);
+        rc = handler(pReqBody, nReqBodyLen, respBuffer.data(), nRespLen);
+    }
 
     std::vector<uint8_t> fullResp(sizeof(TRpcResponseEnvelope) + nRespLen);
     TRpcResponseEnvelope* pRespEnv = (TRpcResponseEnvelope*)fullResp.data();
@@ -195,11 +200,13 @@ static RC RpcClientReplyCallback(PTCbMessage pMsg)
     if (it != g_mPendingCalls.end())
     {
         RpcPendingCall* pCall = it->second;
-        std::lock_guard<std::mutex> clk(pCall->mtx);
         pCall->status = pResp->nResult;
         const uint8_t* pBody = (const uint8_t*)pMsg->pData + sizeof(TRpcResponseEnvelope);
         pCall->respData.assign(pBody, pBody + pResp->nBodyLength);
-        pCall->completed = true;
+        {
+            std::lock_guard<std::mutex> clk(pCall->mtx);
+            pCall->completed.store(true, std::memory_order_release);
+        }
         pCall->cv.notify_one();
     }
     return RC::SUCCESS;
@@ -427,8 +434,14 @@ RC ITeleport::Call(T_PCSTR strTopic, T_PCVOID pReqData, T_UINT32 nReqLen, T_PVOI
         return rc;
     }
 
-    std::unique_lock<std::mutex> clk(call.mtx);
-    bool ok = call.cv.wait_for(clk, std::chrono::milliseconds(nTimeoutMs), [&] { return call.completed; });
+    bool ok = T_ADAPTIVE_WAIT([&] { return call.completed.load(std::memory_order_acquire); }, 1200, 40);
+    if (!ok)
+    {
+        std::unique_lock<std::mutex> clk(call.mtx);
+        ok = call.cv.wait_for(clk, std::chrono::milliseconds(nTimeoutMs), [&] {
+            return call.completed.load(std::memory_order_acquire);
+        });
+    }
 
     {
         std::lock_guard<std::mutex> lk(g_mPendingCallsLock);
@@ -1216,7 +1229,13 @@ RC CChannel::RunSubThread()
             TPLogRecordHeader pRec = m_pChannelData->GetRecordHeader(m_pAckRecord->LastReadOffset);
             if (!(pRec->nFlags & LOG_RECORD_FLAG_PADDING) && pRec->nSequence != targetSeq && !m_bStopped)
             {
-                m_pEventSubRead->Wait(1);
+                bool bFound = T_ADAPTIVE_WAIT([&] {
+                    return (pRec->nFlags & LOG_RECORD_FLAG_PADDING) || pRec->nSequence == targetSeq || m_bStopped;
+                }, 250, 0);
+                if (!bFound && !m_bStopped)
+                {
+                    m_pEventSubRead->Wait(1);
+                }
             }
 #ifdef Windows
             InterlockedDecrement((LONG*)&m_pChannelData->GetShmHeader()->nWaitingSubs);

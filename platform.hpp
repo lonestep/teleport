@@ -16,6 +16,7 @@
 #include <map>
 #include <vector>
 #include <queue>
+#include <unordered_map>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -62,7 +63,7 @@ static inline void T_THREAD_YIELD()
 #endif
 }
 
-// Optimization 3: Hybrid Adaptive Wait
+// Adaptive Wait Primitives
 template<typename Predicate>
 inline bool T_ADAPTIVE_WAIT(Predicate pred, uint32_t spinCount = 300, uint32_t yieldCount = 20)
 {
@@ -177,6 +178,34 @@ namespace TLP
 
 
     //
+#ifdef Windows
+    class GenericMutex
+    {
+    public:
+        GenericMutex() { InitializeSRWLock(&m_srwLock); }
+        virtual ~GenericMutex() {}
+
+        inline RC Lock(T_UINT32 nMilliseconds = INFINITE)
+        {
+            (void)nMilliseconds;
+            AcquireSRWLockExclusive(&m_srwLock);
+            return RC::SUCCESS;
+        }
+        inline RC TryLock(T_UINT32 nMilliseconds = INFINITE)
+        {
+            (void)nMilliseconds;
+            return TryAcquireSRWLockExclusive(&m_srwLock) ? RC::SUCCESS : RC::FAILED;
+        }
+        inline RC Unlock()
+        {
+            ReleaseSRWLockExclusive(&m_srwLock);
+            return RC::SUCCESS;
+        }
+
+    private:
+        SRWLOCK m_srwLock;
+    };
+#else
     class GenericMutex :public BaseMutex
     {
     public:
@@ -184,6 +213,7 @@ namespace TLP
         virtual ~GenericMutex();
 
     };
+#endif
 
 
     //
@@ -202,19 +232,6 @@ namespace TLP
         NamedMutex(T_PCSTR pName);
         virtual ~NamedMutex();
     };
-
-    
-
-#ifdef Windows
-#define T_CPU_PAUSE() YieldProcessor()
-#define T_THREAD_YIELD() SwitchToThread()
-#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-#define T_CPU_PAUSE() __builtin_ia32_pause()
-#define T_THREAD_YIELD() sched_yield()
-#else
-#define T_CPU_PAUSE() ((void)0)
-#define T_THREAD_YIELD() ((void)0)
-#endif
 
 
     //

@@ -627,7 +627,7 @@ T_VOID UT_TestCorruptedMessageDiscard()
 
 
 //
-// Optimization 1 Unit Test: Variable-length messages and zero-copy wrap-around
+// Unit Test: Variable-length messages and zero-copy wrap-around
 //
 static volatile T_UINT32 g_nVarMsgCount = 0;
 static volatile T_UINT32 g_nVarErrorCount = 0;
@@ -703,7 +703,7 @@ T_VOID UT_TestVariableLengthMessages()
 
 
 //
-// Optimization 2 Unit Test: Backpressure policies (POLICY_BLOCK, POLICY_DROP_OLDEST, POLICY_ISOLATE_SLOW_CONSUMER)
+// Unit Test: Backpressure policies (POLICY_BLOCK, POLICY_DROP_OLDEST, POLICY_ISOLATE_SLOW_CONSUMER)
 //
 static RC DummyPolicyCallback(PTCbMessage pMsg) { return RC::SUCCESS; }
 
@@ -754,7 +754,7 @@ T_VOID UT_TestChannelPolicies()
 
 
 //
-// Optimization 4 Unit Test: Synchronous cross-process RPC Request-Response
+// Unit Test: Synchronous cross-process RPC Request-Response
 //
 static RC EchoRpcHandler(T_PCVOID pReq, T_UINT32 nReqLen, T_PVOID pResp, T_UINT32& nRespLen)
 {
@@ -821,7 +821,7 @@ T_VOID UT_TestRpcCall()
 
 
 // ============================================================================
-// RIGOROUS AUTOMATED TESTS FOR ALL 4 OPTIMIZATIONS
+// Extended Feature Test Suite
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -2036,6 +2036,26 @@ T_VOID UT_TestStress(T_UINT32 nTotalMessages = 2000000)
     SHOULD_BE_EQUAL(g_nStressOrderErrorCount, 0);
 }
 
+static inline uint64_t GetHighResNs()
+{
+#ifdef Windows
+    static int64_t qpcFreq = 0;
+    if (qpcFreq == 0)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        qpcFreq = f.QuadPart;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)qpcFreq);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 static std::vector<double> g_vOneWayLatenciesUs;
 static std::mutex g_mtxLatency;
 static RC LatencyTestCallback(PTCbMessage pMessage)
@@ -2043,8 +2063,7 @@ static RC LatencyTestCallback(PTCbMessage pMessage)
     if (pMessage && pMessage->eType == MsgType::MSG_SUB_GET && pMessage->nLength >= sizeof(uint64_t))
     {
         uint64_t sendNs = *(uint64_t*)pMessage->pData;
-        auto nowNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        uint64_t nowNs = GetHighResNs();
         if (nowNs >= sendNs)
         {
             double us = (double)(nowNs - sendNs) / 1000.0;
@@ -2107,8 +2126,7 @@ void UT_BenchmarkLatency(T_UINT32 nSamples = 100000)
     // Warm-up
     for (int w = 0; w < 1000; w++)
     {
-        uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        uint64_t t = GetHighResNs();
         ITeleport::Send(nPubId, &t, sizeof(t));
     }
     TSleep(50);
@@ -2119,8 +2137,7 @@ void UT_BenchmarkLatency(T_UINT32 nSamples = 100000)
 
     for (T_UINT32 i = 0; i < nSamples; i++)
     {
-        uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        uint64_t t = GetHighResNs();
         ITeleport::Send(nPubId, &t, sizeof(t));
         if ((i & 0x1ff) == 0) TSleep(0);
     }
@@ -2150,6 +2167,7 @@ void UT_BenchmarkLatency(T_UINT32 nSamples = 100000)
     char respBuf[64] = {0};
     T_UINT32 respLen = sizeof(respBuf);
 
+    TSleep(20);
     // Warmup
     for (int w = 0; w < 500; w++)
     {
@@ -2160,13 +2178,21 @@ void UT_BenchmarkLatency(T_UINT32 nSamples = 100000)
     for (T_UINT32 i = 0; i < nSamples; i++)
     {
         respLen = sizeof(respBuf);
-        auto tStart = std::chrono::high_resolution_clock::now();
+        uint64_t tStart = GetHighResNs();
         rc = ITeleport::Call(pRpcTopic, reqBuf, 4, respBuf, respLen, 1000, T_FALSE);
-        auto tEnd = std::chrono::high_resolution_clock::now();
+        uint64_t tEnd = GetHighResNs();
         if (IS_SUCCESS(rc))
         {
-            double us = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tStart).count() / 1000.0;
+            double us = (double)(tEnd - tStart) / 1000.0;
             rttLatencies.push_back(us);
+        }
+        else
+        {
+            static int errCount = 0;
+            if (errCount++ < 3)
+            {
+                printf("  [WARN] Call #%u failed with rc=%d\n", i, (int)rc);
+            }
         }
     }
     ITeleport::UnregisterRpcService(pRpcTopic);
@@ -2426,7 +2452,7 @@ int main(int argc, char** argv)
             UT_TestChannelPolicies();
             UT_TestRpcCall();
 
-            // Rigorous automated test cases for all 4 optimizations
+            // Extended feature test cases
             UT_Rigor_VariableLength_BoundaryWrapping();
             UT_Rigor_VariableLength_ConcurrentMultiThread();
             UT_Rigor_Policy_Block_Backpressure();

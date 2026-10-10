@@ -9,6 +9,26 @@
 #include "platform.hpp"
 #include <cstddef>
 
+#ifdef Windows
+#if defined(_MSC_VER)
+#include <timeapi.h>
+#else
+#include <mmsystem.h>
+#endif
+struct WindowsTimerResolutionInit
+{
+    WindowsTimerResolutionInit()
+    {
+        timeBeginPeriod(1);
+    }
+    ~WindowsTimerResolutionInit()
+    {
+        timeEndPeriod(1);
+    }
+};
+static WindowsTimerResolutionInit g_winTimerInit;
+#endif
+
 using namespace TLP;
 
 
@@ -231,7 +251,7 @@ NamedEvent::NamedEvent(T_PCSTR pName):
 
     BaseEvent::m_hHandle = CreateEventExA(pSecAttr,  
         m_strName, 
-        CREATE_EVENT_MANUAL_RESET, 
+        0, 
         EVENT_MODIFY_STATE | SYNCHRONIZE);
 
     if(T_NULL == BaseEvent::m_hHandle)
@@ -373,16 +393,10 @@ RC BaseEvent::Wait(T_UINT32 nMilliseconds)
 }
 
 
+#ifndef Windows
 //
 GenericMutex::GenericMutex()
 {
-#ifdef Windows
-    m_hHandle = CreateMutexA(NULL, FALSE, NULL);
-    if (T_INVHDL == m_hHandle)
-    {
-        LogVital("Unable to create generic mutex!");
-    }
-#else
     pthread_mutex_t* pMutex = new pthread_mutex_t;
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -390,15 +404,12 @@ GenericMutex::GenericMutex()
     pthread_mutex_init(pMutex, &attr);
     pthread_mutexattr_destroy(&attr);
     m_hHandle = (T_HANDLE)pMutex;
-#endif
 }
 
 
 //
 GenericMutex::~GenericMutex()
 {
-#ifdef Windows
-#else
     if (m_hHandle != T_INVHDL && m_hHandle != T_NULL)
     {
         pthread_mutex_t* pMutex = (pthread_mutex_t*)m_hHandle;
@@ -406,8 +417,8 @@ GenericMutex::~GenericMutex()
         delete pMutex;
         m_hHandle = T_INVHDL;
     }
-#endif
 }
+#endif
 
 
 //

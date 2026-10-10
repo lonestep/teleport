@@ -12,6 +12,9 @@
 #ifndef Windows
 #define Windows 1
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 #endif
 
 #ifdef Windows
@@ -288,7 +291,7 @@ namespace TLP
         MSG_DROPPED        // Notification when message(s) were dropped
     };
 
-    // Optimization 2: QoS & Flow Control Backpressure Policies
+    // QoS & Flow Control Backpressure Policies
     enum class ChannelPolicy : T_UINT32
     {
         POLICY_BLOCK = 0,               // Default: Block publishers when buffer full (Zero loss, strict FIFO)
@@ -326,7 +329,7 @@ namespace TLP
 #define MAX_LOG_MESSAGE_SIZE     (4 * 1024 * 1024) // 4 MB maximum message size (Aeron style)
 #define MAX_RPC_TOPIC_LEN        64
 
-    // Optimization 1: Scheme A - Compact Ring Record Header (Continuous Log Buffer)
+    // Continuous Ring Log Buffer Record Header
     typedef struct alignas(64) _Log_Record_Header
     {
         volatile T_UINT32 nMagic;        // TELEPORT_MAGIC
@@ -392,7 +395,7 @@ namespace TLP
     }TChannelShmHeader, * TPChannelShmHeader;
 
 
-    // Optimization 4: RPC Envelopes
+    // RPC Envelopes
     typedef struct alignas(8) _Rpc_Envelope
     {
         T_UINT64 nCorrelationId;
