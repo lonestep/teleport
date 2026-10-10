@@ -2,26 +2,45 @@
 
 # Teleport
 
-High-performance, zero-daemon, shared-memory Inter-Process Communication (IPC) library in native C++.
-
 基于共享内存的高性能、无守护进程、原生 C++ 进程间通信（IPC）基础库。
+
+High-performance, zero-daemon, shared-memory Inter-Process Communication (IPC) library in native C++.
 
 ---
 
-## 1. Supported Platforms & Compilers (支持的平台与编译器)
+## 1. 支持的平台与编译器 / Supported Platforms & Compilers
+
+### 支持的平台与编译器
 
 Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流桌面端、服务器端操作系统与容器环境。
 
-| 操作系统 / OS | 最低版本要求 | 验证环境 | 体系架构 |
+| 操作系统 | 最低版本要求 | 验证环境 | 体系架构 |
 | :--- | :--- | :--- | :---: |
 | **Linux** | Linux Kernel 3.10+ | Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 12, RHEL / CentOS 9/10 | x86_64, aarch64 |
 | **Windows** | Windows 7 / Server 2008 R2 | Windows 11, Windows 10, Windows Server 2022 / 2019 | x86_64, x86 |
-| **Container** | OCI 兼容容器运行时 | Docker, Podman (Ubuntu 24.04 LTS Container, Windows VM on KVM) | x86_64 |
+| **Container** | OCI 兼容容器运行时 | Docker, Podman (Ubuntu 24.04 LTS 容器, Windows VM on KVM) | x86_64 |
 
-### 编译器兼容性 (Compiler Compatibility)
+#### 编译器兼容性
 
 * **GCC**: GCC 7.3 及更高版本（完整支持 GCC 11 / 12 / 13 / 14）
 * **Clang**: Clang 9.0 及更高版本（完整支持 Clang 15 / 16 / 17 / 18）
+* **MSVC**: Microsoft Visual Studio 2017 / 2019 / 2022 (MSVC v141 / v142 / v143)
+* **MinGW-w64**: x86_64-w64-mingw32-g++ 8.0+
+
+### Supported Platforms & Compilers
+
+Teleport is implemented in native C++ with zero third-party dependencies, supporting mainstream desktop, server operating systems, and container environments.
+
+| Operating System | Minimum Requirement | Verified Environment | Architecture |
+| :--- | :--- | :--- | :---: |
+| **Linux** | Linux Kernel 3.10+ | Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 12, RHEL / CentOS 9/10 | x86_64, aarch64 |
+| **Windows** | Windows 7 / Server 2008 R2 | Windows 11, Windows 10, Windows Server 2022 / 2019 | x86_64, x86 |
+| **Container** | OCI-compliant container runtime | Docker, Podman (Ubuntu 24.04 LTS Container, Windows VM on KVM) | x86_64 |
+
+#### Compiler Compatibility
+
+* **GCC**: GCC 7.3 and higher (full support for GCC 11 / 12 / 13 / 14)
+* **Clang**: Clang 9.0 and higher (full support for Clang 15 / 16 / 17 / 18)
 * **MSVC**: Microsoft Visual Studio 2017 / 2019 / 2022 (MSVC v141 / v142 / v143)
 * **MinGW-w64**: x86_64-w64-mingw32-g++ 8.0+
 
@@ -57,9 +76,9 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ## 3. 技术对比矩阵 / Technical Comparison Matrix
 
-### 3.1 核心架构与设计选型对比 / Core Architecture Comparison
+### 技术对比矩阵
 
-#### 核心架构与设计选型对比
+#### 3.1 核心架构与设计选型对比
 
 | 核心设计维度 | Teleport | Aeron (IPC) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
 | :--- | :--- | :--- | :--- | :--- |
@@ -70,22 +89,7 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 | **流控与慢消费者** | **三级服务质量策略（严格阻塞 / 覆盖旧数据 / 隔离慢节点）** | 慢消费者阻塞单流所有发布者 | 队列深度限制（保留最新 / 丢弃最旧） | 高低水位线丢弃或阻塞 |
 | **工程引入与依赖** | **5 个原生源文件直接编译，零第三方依赖** | 复杂构建依赖，跨进程驱动部署配置繁重 | 强类型框架绑定，部署与集成复杂度高 | 动态库/静态库引入，依赖外部运行时 |
 
-#### Core Architecture Comparison
-
-| Core Design Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
-| :--- | :--- | :--- | :--- | :--- |
-| **Topology & Channel Model** | **Decentralized 1-to-N Broadcast / Dedicated RPC** | Unidirectional Stream Channel | Pub/Sub and Req/Rep Services | Socket-based Topology (REQ/REP, PUB/SUB) |
-| **External Daemon Dependency** | **Daemon-Free (Direct Peer-to-Peer)** | Requires standalone **Media Driver** daemon | Requires standalone **RouDi** orchestrator daemon | In-process thread engine, no standalone daemon |
-| **Message Length Support** | **1B to 4MB dynamic variable-length (Cache-line padded)** | Fragmented variable-length (Reassembly supported) | Fixed Chunk size (Requires multi-chunk allocation) | Arbitrary variable-length frames |
-| **Wait & Notification Strategy** | **Hybrid Adaptive (Pause Spin -> Yield -> Event Block)** | Busy Spin / IdleStrategy backoff sleep | Polling / POSIX condition variable notification | Kernel event-driven (epoll / kqueue / IOCP) |
-| **Flow Control & Slow Consumers** | **Three-Tier QoS (BLOCK / DROP_OLDEST / ISOLATE)** | Slow consumer blocks all publishers on the stream | Queue depth limits (KeepLast / DropOldest) | High Water Mark (HWM) drop or block |
-| **Integration & Dependencies** | **5 native source files, zero third-party dependencies** | Heavy build dependencies, complex driver operations | C++ framework binding, complex setup process | Dynamic/static library linkage, runtime dependencies |
-
----
-
-### 3.2 技术规格横向对比 / Detailed Comparison Table
-
-#### 技术规格横向对比
+#### 3.2 技术规格横向对比
 
 | 技术维度 | Teleport | Aeron (IPC 模式) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -101,7 +105,20 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 | **独立守护进程依赖** | **无（零守护进程）** | 需独立媒体驱动进程 | 需独立管理中枢进程 | 无 | 无 |
 | **代码集成形态** | **直接引入 5 个源文件编译** | 依赖外部驱动与复杂构建链 | 依赖强类型框架与复杂配置 | 依赖动态库或静态库 | 依赖大型模板库 |
 
-#### Detailed Comparison Table
+### Technical Comparison Matrix
+
+#### 3.1 Core Architecture Comparison
+
+| Core Design Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ / NNG |
+| :--- | :--- | :--- | :--- | :--- |
+| **Topology & Channel Model** | **Decentralized 1-to-N Broadcast / Dedicated RPC** | Unidirectional Stream Channel | Pub/Sub and Req/Rep Services | Socket-based Topology (REQ/REP, PUB/SUB) |
+| **External Daemon Dependency** | **Daemon-Free (Direct Peer-to-Peer)** | Requires standalone **Media Driver** daemon | Requires standalone **RouDi** orchestrator daemon | In-process thread engine, no standalone daemon |
+| **Message Length Support** | **1B to 4MB dynamic variable-length (Cache-line padded)** | Fragmented variable-length (Reassembly supported) | Fixed Chunk size (Requires multi-chunk allocation) | Arbitrary variable-length frames |
+| **Wait & Notification Strategy** | **Hybrid Adaptive (Pause Spin -> Yield -> Event Block)** | Busy Spin / IdleStrategy backoff sleep | Polling / POSIX condition variable notification | Kernel event-driven (epoll / kqueue / IOCP) |
+| **Flow Control & Slow Consumers** | **Three-Tier QoS (BLOCK / DROP_OLDEST / ISOLATE)** | Slow consumer blocks all publishers on the stream | Queue depth limits (KeepLast / DropOldest) | High Water Mark (HWM) drop or block |
+| **Integration & Dependencies** | **5 native source files, zero third-party dependencies** | Heavy build dependencies, complex driver operations | C++ framework binding, complex setup process | Dynamic/static library linkage, runtime dependencies |
+
+#### 3.2 Detailed Comparison Table
 
 | Dimension | Teleport | Aeron (IPC Mode) | Iceoryx / Iceoryx2 | ZeroMQ (IPC) | Boost.Interprocess |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -119,7 +136,7 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ---
 
-## 4. Configuration Options (配置参数说明)
+## 4. 配置参数说明 / Configuration Options
 
 ### 4.1 通道打开标志 (Channel Open Flags - OpenFlag)
 
@@ -159,7 +176,7 @@ Teleport 基于纯原生 C++ 实现，无任何第三方库依赖，支持主流
 
 ---
 
-## 5. Build (编译与构建)
+## 5. 编译与构建 / Build
 
 Teleport 支持两种引入方式：
 1. **源码直接嵌入**：直接将 5 个核心源文件（`platform.hpp`, `platform.cpp`, `teleport.hpp`, `teleport.cpp`, `typedefs.hpp`）加入已有工程；
@@ -196,7 +213,7 @@ cmake --build . --config Release
 
 ---
 
-## 6. Getting Started (开发示例)
+## 6. 开发示例 / Getting Started
 
 ### 6.1 基础发布与订阅 (Pub/Sub)
 
@@ -303,7 +320,7 @@ ITeleport::UnregisterRpcService("PricingEngine");
 
 ---
 
-## 7. Automated Testing Suite (自动化测试验证)
+## 7. 自动化测试验证 / Automated Testing Suite
 
 Teleport 提供完整的自动化单元测试集，覆盖并发竞争、大包回绕、背压流控、RPC 调用及错误恢复路径。
 
@@ -318,7 +335,7 @@ teleport.exe ut
 
 ---
 
-## 8. Multi-Platform Benchmark Report (多环境基准测试报告)
+## 8. 多平台基准测试报告 / Multi-Platform Benchmark Report
 
 ### 8.1 测试架构与工作载荷
 
@@ -354,6 +371,7 @@ teleport.exe ut
 | 运行环境 | Min (最小值) | P50 (中位数) | Mean (平均值) | P90 (90分位) | P99 (99分位) | P99.9 (99.9分位) | Max (最大值) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Ubuntu 24.04 LTS (原生)** | **106 ns** | **1,017 ns** (1.02 µs) | **1,133 ns** (1.13 µs) | **1,743 ns** | **5,068 ns** | **26.8 µs** | **30.0 µs** |
+| **CentOS Stream 10 (原生)** | **134 ns** | **1,020 ns** (1.02 µs) | **1,546 ns** (1.55 µs) | **2,293 ns** | **14.3 µs** | **57.6 µs** | **85.4 µs** |
 | **Windows 10/11 (Win32)** | **100 ns** | **300 ns** (0.30 µs) | **474 ns** (0.47 µs) | **1,000 ns** | **2,700 ns** | **8.0 µs** | **386.2 µs** |
 
 #### 同步跨进程 RPC 往返时延 (Synchronous RPC Round-Trip Time)
@@ -361,6 +379,7 @@ teleport.exe ut
 | 运行环境 | Min (最小值) | P50 (中位数) | Mean (平均值) | P90 (90分位) | P99 (99分位) | P99.9 (99.9分位) | Max (最大值) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Ubuntu 24.04 LTS (原生)** | **14.88 µs** | **16.94 µs** | **17.67 µs** | **19.66 µs** | **28.52 µs** | **162.3 µs** | **430.8 µs** |
+| **CentOS Stream 10 (原生)** | **15.09 µs** | **17.12 µs** | **17.77 µs** | **19.67 µs** | **23.97 µs** | **111.0 µs** | **450.2 µs** |
 | **Windows 10/11 (Win32)** | **160.4 µs** | **175.5 µs** | **180.2 µs** | **194.2 µs** | **266.8 µs** | **510.4 µs** | **2.23 ms** |
 
 ---
@@ -413,7 +432,7 @@ teleport.exe ut
 
 ---
 
-## 9. License
+## 9. 软件许可证 / License
 
 Copyright (c) lonestep. All rights reserved.
 
