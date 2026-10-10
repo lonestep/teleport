@@ -475,7 +475,8 @@ NamedMutex::NamedMutex(T_PCSTR pName) :
     }
     
     PosixNamedMutexData* pData = (PosixNamedMutexData*)addr;
-    if (bNew || pData->init_magic != 0x544C504D) // 'TLPM'
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&pData->init_magic, &expected, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
     {
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
@@ -484,7 +485,14 @@ NamedMutex::NamedMutex(T_PCSTR pName) :
         pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
         pthread_mutex_init(&pData->mutex, &attr);
         pthread_mutexattr_destroy(&attr);
-        pData->init_magic = 0x544C504D;
+        __atomic_store_n(&pData->init_magic, 0x544C504D, __ATOMIC_SEQ_CST);
+    }
+    else
+    {
+        while (__atomic_load_n(&pData->init_magic, __ATOMIC_SEQ_CST) != 0x544C504D)
+        {
+            sched_yield();
+        }
     }
     
     BaseMutex::m_hHandle = (T_HANDLE)&pData->mutex;
